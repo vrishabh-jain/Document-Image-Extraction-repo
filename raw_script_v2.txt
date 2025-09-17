@@ -429,41 +429,153 @@ def _build_prompt_for_image(page_text):
 
 async def _azure_generate_with_image_async(prompt_text, img_bytes, img_ext):
     """
-    Async helper that calls the AsyncAzureOpenAI client's generation method.
-    This wrapper encodes the image in base64 and sends it along with the text prompt.
-    The exact call signature used here follows a reasonable expectation for an async client;
-    adapt if your AsyncAzureOpenAI client expects a different method / parameters.
-    """
-    mime_type = f"image/{img_ext}"
-    # Prepare payload - many Azure wrappers accept messages or content pieces.
-    # Here we pass a structure with text + base64 image blob.
-    payload = {
-        "model": MODEL,
-        "input": [
-            {"role": "user", "content": prompt_text},
-            {"type": "image", "mime_type": mime_type, "data_base64": base64.b64encode(img_bytes).decode()}
-        ]
-    }
+    Adapter for AsyncAzureOpenAI from the official `openai` package.
 
-    # Call the async client's generate method. Adjust if your client uses a different method name.
-    # We're using `generate_content` here to mirror the earlier Gemini call shape.
-    resp = await openai_llm.generate_content(payload)
-    # We expect resp to have a `text` attribute or similar. If not, adapt accordingly.
-    # Return textual result (guarding for attribute differences).
-    if hasattr(resp, "text"):
-        return resp.text
-    elif isinstance(resp, dict):
-        # common shape: {"choices":[{"message":{"content":"..."}}]}
-        # attempt to extract common fields conservatively
-        choices = resp.get("choices") or []
-        if choices:
-            first = choices[0]
-            msg = first.get("message") or first.get("delta") or first
-            if isinstance(msg, dict):
-                return msg.get("content") or msg.get("text") or str(resp)
-        return str(resp)
-    else:
-        return str(resp)
+    Strategy:
+    - Build a messages list (chat-style) with the prompt as user content.
+    - Attach the image as a base64 string appended to the prompt (many Azure/OpenAI
+      wrappers accept only text-based input in chat endpoints).
+    - Try common async client call shapes in this order:
+        1) openai_llm.chat.completions.create(...)
+        2) openai_llm.chat.create(...)              (alternate chat create name)
+        3) create_chat_completion / get_chat_completions variants
+        4) fallbacks: generate / complete
+    - Normalize the response to return a plain text string.
+    """
+    import base64
+    mime_type = f"image/{img_ext}"
+    image_b64 = base64.b64encode(img_bytes).decode()
+
+    # Build a chat-style messages list. We append the base64 as part of the user content.
+    # This is compatible with the chat completion interfaces used by the OpenAI Python SDK.
+    messages = [
+        {"role": "user", "content": prompt_text + f"\n\n[IMAGE_BASE64:{image_b64}]"}
+    ]
+
+    # Candidate call attempts (ordered)
+    last_exc = None
+
+    # 1) Preferred: `client.chat.completions.create(...)` (common with the generated client)
+    try:
+        if hasattr(openai_llm, "chat") and hasattr(openai_llm.chat, "completions") and hasattr(openai_llm.chat.completions, "create"):
+            resp = await openai_llm.chat.completions.create(model=MODEL, messages=messages)
+            # Normalize and return
+            # common shape: resp.choices[0].message.content or resp.choices[0].message["content"]
+            if hasattr(resp, "choices") and len(resp.choices) > 0:
+                first = resp.choices[0]
+                # object style
+                if hasattr(first, "message") and hasattr(first.message, "content"):
+                    return first.message.content
+                # dict-style inside
+                if isinstance(first, dict):
+                    msg = first.get("message") or first
+                    if isinstance(msg, dict):
+                        return msg.get("content") or msg.get("text") or str(resp)
+                # fallback to text attribute
+                if hasattr(first, "text"):
+                    return first.text
+            # some returns have .output or .text
+            if hasattr(resp, "output"):
+                return str(resp.output)
+            if hasattr(resp, "text"):
+                return str(resp.text)
+            if isinstance(resp, dict):
+                # common dict shape: {"choices":[{"message": {"content": "..."}}]}
+                choices = resp.get("choices") or []
+                if choices:
+                    first = choices[0]
+                    msg = first.get("message") or first
+                    if isinstance(msg, dict):
+                        return msg.get("content") or msg.get("text") or str(resp)
+                # fallback fields
+                return resp.get("value") or resp.get("content") or str(resp)
+            return str(resp)
+    except Exception as e:
+        last_exc = e
+        # If attribute doesn't exist, we'll try other shapes below. If call existed but failed (auth/network),
+        # bubble up so you see the real error.
+        if isinstance(e, AttributeError):
+            pass
+        else:
+            raise
+
+    # 2) Alternate chat create (some versions / wrappers expose chat.create)
+    try:
+        if hasattr(openai_llm, "chat") and hasattr(openai_llm.chat, "create"):
+            resp = await openai_llm.chat.create(model=MODEL, messages=messages)
+            # Try to extract content similarly
+            if isinstance(resp, dict):
+                choices = resp.get("choices") or []
+                if choices:
+                    first = choices[0]
+                    if isinstance(first, dict):
+                        msg = first.get("message") or first
+                        if isinstance(msg, dict):
+                            return msg.get("content") or msg.get("text") or str(resp)
+                    return str(first)
+            if hasattr(resp, "choices") and len(resp.choices) > 0:
+                first = resp.choices[0]
+                if hasattr(first, "message") and hasattr(first.message, "content"):
+                    return first.message.content
+            if hasattr(resp, "text"):
+                return resp.text
+            return str(resp)
+    except Exception as e:
+        last_exc = e
+        if not isinstance(e, AttributeError):
+            raise
+
+    # 3) Other common SDK convenience methods
+    candidates = [
+        ("create_chat_completion", lambda: openai_llm.create_chat_completion(model=MODEL, messages=messages)),
+        ("get_chat_completions", lambda: openai_llm.get_chat_completions(model=MODEL, messages=messages)),
+        ("get_chat_completion", lambda: openai_llm.get_chat_completion(model=MODEL, messages=messages)),
+        ("generate", lambda: openai_llm.generate({"model": MODEL, "messages": messages})),
+        ("complete", lambda: openai_llm.complete({"model": MODEL, "messages": messages})),
+    ]
+    for name, fn in candidates:
+        try:
+            if hasattr(openai_llm, name) or name in ("generate", "complete"):
+                resp = await fn()
+                # Normalization similar to above
+                if hasattr(resp, "text"):
+                    return resp.text
+                if isinstance(resp, dict):
+                    choices = resp.get("choices") or []
+                    if choices:
+                        first = choices[0]
+                        if isinstance(first, dict):
+                            msg = first.get("message") or first
+                            if isinstance(msg, dict):
+                                return msg.get("content") or msg.get("text") or str(resp)
+                            return str(first)
+                    if "value" in resp:
+                        return resp["value"]
+                    if "content" in resp:
+                        return resp["content"]
+                    return str(resp)
+                if hasattr(resp, "choices") and len(resp.choices) > 0:
+                    first = resp.choices[0]
+                    if hasattr(first, "message") and hasattr(first.message, "content"):
+                        return first.message.content
+                    if hasattr(first, "text"):
+                        return first.text
+                    return str(first)
+                return str(resp)
+        except AttributeError as e:
+            last_exc = e
+            continue
+        except Exception:
+            # If method exists but failed (auth, request format), raise to surface the actual error.
+            raise
+
+    # If no method existed or succeeded, raise a clear message including the last AttributeError
+    raise AttributeError(
+        "openai_llm (AsyncAzureOpenAI) does not expose a known async chat/complete method on this SDK version. "
+        "Tried `chat.completions.create`, `chat.create`, and common alternatives. "
+        f"Last error: {last_exc}"
+    )
+
 
 
 def gemini_describe(img_bytes, img_ext, page_text):
