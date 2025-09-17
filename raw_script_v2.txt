@@ -1,0 +1,840 @@
+# integrated_azure_multimodal.py
+import os
+import json
+import io
+import tempfile
+import requests
+import statistics
+import base64
+
+# file-type and document libs
+import fitz  # PyMuPDF
+from PIL import Image
+from zipfile import ZipFile
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+import docx
+from pptx import Presentation
+
+# env / db / creds
+from dotenv import load_dotenv
+load_dotenv()
+
+import psycopg2
+
+# ---------------------------
+# Load local credentials (must contain "db" dict)
+# ---------------------------
+with open(f"{os.getcwd()}{os.sep}cred.json", "r") as f:
+    cred = json.load(f)
+
+
+def get_token_v2():
+    """
+    Connect to DB using cred['db'] and return 'spn' from meta table.
+    """
+    con = psycopg2.connect(**cred["db"])
+    spn = None
+    try:
+        with con.cursor() as cur:
+            cur.execute("SELECT value, last_update_time FROM meta WHERE key='spn';")
+            results = cur.fetchall()
+            if len(results) > 0:
+                spn, last_update_time = results[0]
+            else:
+                raise Exception("Failed to select 'spn' from meta")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return spn
+
+
+# fetch azure AD token from DB
+try:
+    azure_ad_token = get_token_v2()
+except Exception as e:
+    print("⚠️ Failed to fetch Azure AD token from DB:", e)
+    azure_ad_token = None
+
+# Azure configuration (from your original snippet)
+azure_endpoint = "https://iwpb-aap-dev-wus.openai.azure.com"  # no trailing slash here; will normalize later
+azure_deployment = "gpt-4.1-nano"
+azure_api_version = "2025-01-01-preview"
+
+# ---------------------------
+# Helper: call Azure Responses multimodal endpoint
+# ---------------------------
+def azure_responses_multimodal(prompt_text: str, img_bytes: bytes, img_ext: str, max_tokens: int = 1024, temperature: float = 0.2):
+    """
+    Send prompt_text + image (as data URL) to Azure Responses endpoint for your deployment.
+    Returns the assistant text response (string).
+    NOTE: This uses the Responses API path: /openai/deployments/{deployment}/responses?api-version={api_version}
+    The request body uses an 'input' array containing an object with a content array: text + image (data URL).
+    """
+    if not azure_ad_token:
+        raise ValueError("Azure AD token not available for Azure OpenAI calls.")
+
+    base = azure_endpoint.rstrip('/')
+    url = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
+
+    # Build data URL for image: data:image/{ext};base64,<b64>
+    # Normalize ext (e.g., 'jpeg' or 'png')
+    ext = img_ext.lower().lstrip('.')
+    if ext == 'jpg':
+        ext = 'jpeg'
+    mime = f"image/{ext}"
+    b64 = base64.b64encode(img_bytes).decode('ascii', errors='ignore')
+    data_url = f"data:{mime};base64,{b64}"
+
+    # Construct body using content array with text and image object (supported shapes per docs/community examples)
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt_text},
+                    {"type": "input_image", "image_url": data_url}
+                ]
+            }
+        ],
+        # optional params
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "n": 1
+    }
+
+    headers = {
+        "Authorization": f"Bearer {azure_ad_token}",
+        "Content-Type": "application/json"
+    }
+
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
+    if resp.status_code >= 400:
+        # attempt to include body for debugging in error message (trim)
+        raise ValueError(f"Azure Responses API error {resp.status_code}: {resp.text[:1000]}")
+
+    j = resp.json()
+    # Response parsing — Responses shape can vary; try common locations for generated text.
+    # Try: j['output'][0]['content'][0]['text'] OR j['choices'][0]['message']['content'] OR j['items']...
+    text = ""
+    try:
+        # Newer Responses API often contains 'output' array with items containing content blocks
+        output = j.get("output") or j.get("outputs") or j.get("response") or None
+        if output and isinstance(output, list):
+            # find first text block
+            for o in output:
+                content = o.get("content") if isinstance(o, dict) else None
+                if content and isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") in ("output_text", "message") and c.get("text"):
+                            text = c.get("text")
+                            break
+                    if text:
+                        break
+        # fallback: look for choices -> message
+        if not text:
+            choices = j.get("choices", [])
+            if choices and isinstance(choices, list):
+                ch0 = choices[0]
+                # typical shapes:
+                text = ch0.get("text") or ch0.get("message", {}).get("content", "")
+        # last fallback: join any present strings in top-level fields
+        if not text:
+            # try to extract nested text fields heuristically
+            def walk_for_text(obj):
+                if isinstance(obj, str):
+                    return obj
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        res = walk_for_text(v)
+                        if res:
+                            return res
+                if isinstance(obj, list):
+                    for item in obj:
+                        res = walk_for_text(item)
+                        if res:
+                            return res
+                return None
+            text = walk_for_text(j) or ""
+    except Exception:
+        text = ""
+
+    return text.strip()
+
+
+# ---------------------------
+# Simple fallback to text-only completions (if multimodal call fails)
+# ---------------------------
+def azure_text_completion(prompt_text: str, max_tokens: int = 1024, temperature: float = 0.2):
+    """
+    Simple text-only fallback using the same Responses endpoint with only text input.
+    """
+    if not azure_ad_token:
+        raise ValueError("Azure AD token not available for Azure OpenAI calls.")
+
+    base = azure_endpoint.rstrip('/')
+    url = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
+
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt_text}
+                ]
+            }
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "n": 1
+    }
+
+    headers = {
+        "Authorization": f"Bearer {azure_ad_token}",
+        "Content-Type": "application/json"
+    }
+
+    resp = requests.post(url, headers=headers, json=body, timeout=30)
+    if resp.status_code >= 400:
+        raise ValueError(f"Azure text Responses error {resp.status_code}: {resp.text[:1000]}")
+    j = resp.json()
+    # Extract text similar to multimodal parser
+    text = ""
+    try:
+        choices = j.get("choices", [])
+        if choices:
+            text = choices[0].get("text") or choices[0].get("message", {}).get("content", "")
+        if not text:
+            output = j.get("output") or j.get("outputs") or []
+            for o in output:
+                content = o.get("content") if isinstance(o, dict) else None
+                if content and isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") in ("output_text", "message") and c.get("text"):
+                            text = c.get("text")
+                            break
+                    if text:
+                        break
+    except Exception:
+        text = ""
+
+    return text.strip()
+
+
+# ======================
+# Now the document processing and extractors (unchanged from Code 2, aside from renaming the describe function)
+# ======================
+
+def extract_figures_from_pdf(pdf_path, output_dir, min_size):
+    if not isinstance(min_size, int) or min_size < 0:
+        raise ValueError("min_size must be a non-negative integer")
+
+    os.makedirs(output_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    image_data = []
+    skipped = 0
+
+    for page_index, page in enumerate(doc):
+        images = page.get_images(full=True)
+        for img_index, img in enumerate(images):
+            xref = img[0]
+            smask = img[1]
+
+            try:
+                base_pix = fitz.Pixmap(doc, xref)
+            except Exception:
+                continue
+
+            if getattr(base_pix, "alpha", False):
+                try:
+                    base_pix_no_alpha = fitz.Pixmap(base_pix, 0)
+                    base_pix = base_pix_no_alpha
+                except Exception:
+                    pass
+
+            pix = base_pix
+            if smask and smask > 0:
+                try:
+                    mask_pix = fitz.Pixmap(doc, smask)
+                    try:
+                        pix = fitz.Pixmap(base_pix, mask_pix)
+                    except Exception:
+                        pix = base_pix
+                    finally:
+                        mask_pix = None
+                except Exception:
+                    pix = base_pix
+
+            try:
+                if getattr(pix, "colorspace", None) and pix.colorspace.n > 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+            except Exception:
+                pass
+
+            try:
+                sample_len = len(pix.samples)
+            except Exception:
+                sample_len = 0
+
+            if sample_len < min_size:
+                skipped += 1
+                pix = None
+                base_pix = None
+                continue
+
+            temp_path = os.path.join(output_dir, f"temp_page_{page_index+1}_figure_{img_index+1}.png")
+            try:
+                pix.save(temp_path)
+            except Exception:
+                pix = None
+                base_pix = None
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+                continue
+
+            try:
+                pil_img = Image.open(temp_path)
+            except Exception:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                pix = None
+                base_pix = None
+                continue
+
+            if pil_img.mode in ('RGBA', 'LA', 'P'):
+                if pil_img.mode == 'P':
+                    pil_img = pil_img.convert('RGBA')
+                background = Image.new("RGB", pil_img.size, (255, 255, 255))
+                try:
+                    alpha = pil_img.split()[3] if pil_img.mode == 'RGBA' else pil_img.split()[1]
+                    background.paste(pil_img, mask=alpha)
+                except Exception:
+                    background.paste(pil_img)
+                pil_img = background
+
+            img_ext = "jpeg"
+            img_path = os.path.join(output_dir, f"page_{page_index+1}_figure_{img_index+1}.{img_ext}")
+            try:
+                pil_img.save(img_path, "JPEG", quality=95)
+            except Exception:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+                pix = None
+                base_pix = None
+                continue
+
+            try:
+                with open(img_path, "rb") as f:
+                    img_bytes = f.read()
+            except Exception:
+                img_bytes = b''
+
+            image_data.append((img_path, img_bytes, img_ext, page_index))
+
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+            pix = None
+            base_pix = None
+
+    doc.close()
+    print(f"✅ Extracted {len(image_data)} figure images to {output_dir} (skipped {skipped} by min_size)")
+    return image_data
+
+
+def extract_figures_from_docx(docx_path, output_dir, min_size):
+    if not isinstance(min_size, int) or min_size < 0:
+        raise ValueError("min_size must be a non-negative integer")
+
+    os.makedirs(output_dir, exist_ok=True)
+    image_data = []
+    skipped = 0
+
+    try:
+        with ZipFile(docx_path) as zipf:
+            media_files = [name for name in zipf.namelist() if name.startswith('word/media/')]
+            for img_index, media in enumerate(media_files, 1):
+                try:
+                    img_bytes = zipf.read(media)
+                except Exception:
+                    continue
+                if len(img_bytes) < min_size:
+                    skipped += 1
+                    continue
+                try:
+                    pil_img = Image.open(io.BytesIO(img_bytes))
+                except Exception:
+                    continue
+
+                if pil_img.mode in ('RGBA', 'LA', 'P'):
+                    if pil_img.mode == 'P':
+                        pil_img = pil_img.convert('RGBA')
+                    background = Image.new("RGB", pil_img.size, (255, 255, 255))
+                    try:
+                        alpha = pil_img.split()[3] if pil_img.mode == 'RGBA' else pil_img.split()[1]
+                        background.paste(pil_img, mask=alpha)
+                    except Exception:
+                        background.paste(pil_img)
+                    pil_img = background
+
+                img_ext = "jpeg"
+                base_name = os.path.splitext(os.path.basename(media))[0]
+                img_path = os.path.join(output_dir, f"docx_{base_name}_{img_index}.{img_ext}")
+                try:
+                    pil_img.save(img_path, "JPEG", quality=95)
+                except Exception:
+                    continue
+
+                try:
+                    with open(img_path, "rb") as f:
+                        saved_bytes = f.read()
+                except Exception:
+                    saved_bytes = img_bytes
+
+                image_data.append((img_path, saved_bytes, img_ext, 0))
+    except Exception as e:
+        print("⚠️ DOCX extraction error:", e)
+
+    print(f"✅ Extracted {len(image_data)} figure images to {output_dir} (skipped {skipped} by min_size)")
+    return image_data
+
+
+def extract_figures_from_pptx(pptx_path, output_dir, min_size):
+    if not isinstance(min_size, int) or min_size < 0:
+        raise ValueError("min_size must be a non-negative integer")
+
+    os.makedirs(output_dir, exist_ok=True)
+    image_data = []
+    skipped = 0
+
+    try:
+        with ZipFile(pptx_path) as zipf:
+            media_files = [name for name in zipf.namelist() if name.startswith('ppt/media/')]
+            for img_index, media in enumerate(media_files, 1):
+                try:
+                    img_bytes = zipf.read(media)
+                except Exception:
+                    continue
+                if len(img_bytes) < min_size:
+                    skipped += 1
+                    continue
+                try:
+                    pil_img = Image.open(io.BytesIO(img_bytes))
+                except Exception:
+                    continue
+
+                if pil_img.mode in ('RGBA', 'LA', 'P'):
+                    if pil_img.mode == 'P':
+                        pil_img = pil_img.convert('RGBA')
+                    background = Image.new("RGB", pil_img.size, (255, 255, 255))
+                    try:
+                        alpha = pil_img.split()[3] if pil_img.mode == 'RGBA' else pil_img.split()[1]
+                        background.paste(pil_img, mask=alpha)
+                    except Exception:
+                        background.paste(pil_img)
+                    pil_img = background
+
+                img_ext = "jpeg"
+                base_name = os.path.splitext(os.path.basename(media))[0]
+                img_path = os.path.join(output_dir, f"pptx_{base_name}_{img_index}.{img_ext}")
+                try:
+                    pil_img.save(img_path, "JPEG", quality=95)
+                except Exception:
+                    continue
+
+                try:
+                    with open(img_path, "rb") as f:
+                        saved_bytes = f.read()
+                except Exception:
+                    saved_bytes = img_bytes
+
+                image_data.append((img_path, saved_bytes, img_ext, 0))
+    except Exception as e:
+        print("⚠️ PPTX extraction error:", e)
+
+    print(f"✅ Extracted {len(image_data)} figure images to {output_dir} (skipped {skipped} by min_size)")
+    return image_data
+
+
+def extract_figures_from_html(html_path, output_dir, min_size):
+    if not isinstance(min_size, int) or min_size < 0:
+        raise ValueError("min_size must be a non-negative integer")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, 'html.parser')
+
+    image_data = []
+    base_dir = os.path.dirname(html_path)
+    skipped = 0
+    img_index = 0
+
+    for img_tag in soup.find_all('img'):
+        src = img_tag.get('src') or img_tag.get('data-src') or img_tag.get('data-original')
+        if not src:
+            continue
+
+        if src.startswith('//'):
+            src = 'https:' + src
+
+        img_bytes = None
+        if src.startswith('http://') or src.startswith('https://'):
+            try:
+                resp = requests.get(src, timeout=5)
+                if resp.status_code == 200:
+                    img_bytes = resp.content
+            except Exception:
+                img_bytes = None
+        else:
+            local_path = os.path.join(base_dir, src)
+            if os.path.exists(local_path):
+                try:
+                    with open(local_path, 'rb') as lf:
+                        img_bytes = lf.read()
+                except Exception:
+                    img_bytes = None
+
+        if not img_bytes:
+            continue
+
+        if len(img_bytes) < min_size:
+            skipped += 1
+            continue
+
+        try:
+            pil_img = Image.open(io.BytesIO(img_bytes))
+        except Exception:
+            continue
+
+        if pil_img.mode in ('RGBA', 'LA', 'P'):
+            if pil_img.mode == 'P':
+                pil_img = pil_img.convert('RGBA')
+            background = Image.new("RGB", pil_img.size, (255, 255, 255))
+            try:
+                alpha = pil_img.split()[3] if pil_img.mode == 'RGBA' else pil_img.split()[1]
+                background.paste(pil_img, mask=alpha)
+            except Exception:
+                background.paste(pil_img)
+            pil_img = background
+
+        img_ext = "jpeg"
+        img_index += 1
+        img_path = os.path.join(output_dir, f"html_image_{img_index}.{img_ext}")
+        try:
+            pil_img.save(img_path, "JPEG", quality=95)
+        except Exception:
+            continue
+
+        try:
+            with open(img_path, "rb") as f:
+                saved_bytes = f.read()
+        except Exception:
+            saved_bytes = img_bytes
+
+        image_data.append((img_path, saved_bytes, img_ext, 0))
+
+    print(f"✅ Extracted {len(image_data)} figure images to {output_dir} (skipped {skipped} by min_size)")
+    return image_data
+
+
+def get_context(doc, context_id, ext):
+    if ext == '.pdf':
+        page = doc[context_id]
+        return page.get_text()
+    elif ext == '.docx':
+        return '\n'.join([p.text for p in doc.paragraphs])
+    elif ext == '.pptx':
+        text = ''
+        for slide in doc.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    text += shape.text + '\n'
+        return text
+    elif ext == '.html':
+        return doc.get_text(separator='\n')
+    else:
+        return ''
+
+
+# Replaced Gemini describe with azure_describe (multimodal via Azure)
+def azure_describe(img_bytes, img_ext, page_text):
+    """
+    Uses Azure OpenAI Responses multimodal API (gpt-4.1-nano) to describe the image in context.
+    Tries multimodal call first; falls back to text-only call if multimodal fails.
+    """
+    prompt = f"Here is the text from the page containing this image:\n{page_text}\n\nExtract all visible text from the image and provide a detailed description of this image in the context of the document and the surrounding page text. If it's a diagram or chart, describe relationships, labels, structure, and what it illustrates in the context of the document."
+
+    try:
+        return azure_responses_multimodal(prompt, img_bytes, img_ext, max_tokens=1024, temperature=0.15)
+    except Exception as e:
+        print("⚠️ Multimodal call failed, falling back to text-only. Error:", e)
+        try:
+            # Provide a hint that this was fallback (we still include a small note so user knows)
+            fallback_prompt = prompt + "\n\n(Note: the image could not be sent; please reason based on the page text only.)"
+            return azure_text_completion(fallback_prompt, max_tokens=1024, temperature=0.15)
+        except Exception as e2:
+            print("⚠️ Text-only fallback also failed:", e2)
+            return ""
+
+
+def _download_url_to_tempfile(url, timeout=10):
+    try:
+        head = requests.head(url, allow_redirects=True, timeout=5)
+    except Exception:
+        head = None
+
+    content_type = None
+    if head is not None and 'content-type' in head.headers:
+        content_type = head.headers['content-type']
+
+    if not content_type:
+        resp = requests.get(url, stream=True, timeout=timeout)
+    else:
+        resp = requests.get(url, stream=True, timeout=timeout)
+
+    if resp.status_code >= 400:
+        raise ValueError(f"Failed to fetch URL: {url} (status {resp.status_code})")
+
+    ct = resp.headers.get('content-type', content_type or '').lower()
+
+    if 'html' in ct:
+        ext = '.html'
+    elif 'pdf' in ct:
+        ext = '.pdf'
+    elif 'presentation' in ct or 'pptx' in ct:
+        ext = '.pptx'
+    elif 'word' in ct or 'officedocument.wordprocessingml.document' in ct or 'msword' in ct:
+        ext = '.docx'
+    elif 'image' in ct:
+        subtype = ct.split('/')[-1].split(';')[0] if '/' in ct else 'jpeg'
+        ext = f".{subtype}" if not subtype.startswith('x-') else f".{subtype.replace('x-', '')}"
+    else:
+        path = urlparse(url).path
+        _, ext = os.path.splitext(path)
+        if not ext:
+            ext = '.html'
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
+    os.close(tmp_fd)
+
+    with open(tmp_path, 'wb') as out_f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                out_f.write(chunk)
+
+    return tmp_path, ext
+
+
+def determine_min_size(file_path, ext, mode='balanced', sample_limit=8, min_absolute=5000):
+    sizes = []
+    try:
+        if ext == '.pdf':
+            doc = fitz.open(file_path)
+            for page_index, page in enumerate(doc):
+                if len(sizes) >= sample_limit:
+                    break
+                for img in page.get_images(full=True):
+                    if len(sizes) >= sample_limit:
+                        break
+                    xref = img[0]
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                        sizes.append(len(pix.samples))
+                        pix = None
+                    except Exception:
+                        continue
+            doc.close()
+
+        elif ext == '.docx':
+            try:
+                doc = docx.Document(file_path)
+                for rel in list(doc.part.rels.values()):
+                    if len(sizes) >= sample_limit:
+                        break
+                    if "image" in rel.reltype:
+                        try:
+                            blob = rel.target_part.blob
+                            sizes.append(len(blob))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        elif ext == '.pptx':
+            try:
+                with ZipFile(file_path) as zipf:
+                    media_files = [name for name in zipf.namelist() if name.startswith('ppt/media/')]
+                    for media in media_files[:sample_limit]:
+                        try:
+                            b = zipf.read(media)
+                            sizes.append(len(b))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        elif ext in ('.html', '.htm'):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    soup = BeautifulSoup(f, 'html.parser')
+                img_tags = soup.find_all('img')[:sample_limit]
+                for tag in img_tags:
+                    src = (tag.get('src') or tag.get('data-src') or tag.get('data-original') or tag.get('data-srcset') or '').strip()
+                    if not src:
+                        continue
+                    if src.startswith('//'):
+                        src = 'https:' + src
+                    if src.startswith('http'):
+                        try:
+                            head = requests.head(src, allow_redirects=True, timeout=3)
+                            cl = head.headers.get('content-length')
+                            if cl and cl.isdigit():
+                                sizes.append(int(cl))
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            resp = requests.get(src, stream=True, timeout=5)
+                            if resp.status_code == 200:
+                                sizes.append(len(resp.content))
+                        except Exception:
+                            continue
+                    else:
+                        local_path = os.path.join(os.path.dirname(file_path), src)
+                        if os.path.exists(local_path):
+                            try:
+                                with open(local_path, 'rb') as lf:
+                                    data = lf.read()
+                                    sizes.append(len(data))
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+
+    except Exception:
+        sizes = []
+
+    if mode == 'aggressive':
+        multiplier = 0.25
+    elif mode == 'conservative':
+        multiplier = 1.2
+    else:
+        multiplier = 0.5
+
+    if sizes:
+        med = int(statistics.median(sizes))
+        computed = max(int(med * multiplier), min_absolute)
+        computed = int(max(min_absolute, min(computed, max(200000, med * 4))))
+        return computed
+    else:
+        fallback_map = {
+            '.pdf': 50000,
+            '.docx': 15000,
+            '.pptx': 20000,
+            '.html': 8000
+        }
+        return fallback_map.get(ext, min_absolute)
+
+
+def process_document(file_path, determine_mode='balanced'):
+    temp_file_to_remove = None
+    is_url = isinstance(file_path, str) and file_path.lower().startswith(('http://', 'https://'))
+    original_url = file_path if is_url else None
+
+    if is_url:
+        print(f"Detected URL. Downloading: {file_path}")
+        try:
+            tmp_path, tmp_ext = _download_url_to_tempfile(file_path)
+        except Exception as e:
+            raise ValueError(f"Failed to download URL: {file_path}. Error: {e}")
+        temp_file_to_remove = tmp_path
+        file_path_to_use = tmp_path
+    else:
+        file_path_to_use = file_path
+
+    try:
+        ext = os.path.splitext(file_path_to_use)[1].lower()
+        base_output_dir = f"extracted_images_{ext[1:] if ext else 'unknown'}"
+
+        if is_url:
+            parsed = urlparse(file_path)
+            url_basename = os.path.basename(parsed.path) or parsed.netloc
+            file_folder = os.path.splitext(url_basename)[0]
+            file_folder = "".join(c for c in file_folder if c.isalnum() or c in ('_', '-')).strip() or "downloaded_file"
+        else:
+            file_folder = os.path.splitext(os.path.basename(file_path_to_use))[0]
+
+        output_dir = os.path.join(base_output_dir, file_folder)
+        os.makedirs(output_dir, exist_ok=True)
+
+        output_file = os.path.join(output_dir, f"extracted_texts_{file_folder}.txt")
+
+        min_size = determine_min_size(file_path_to_use, ext, mode=determine_mode, sample_limit=8, min_absolute=5000)
+        print(f"Using min_size={min_size} bytes for extraction (mode={determine_mode}).")
+
+        if ext == '.pdf':
+            image_data = extract_figures_from_pdf(file_path_to_use, output_dir, min_size=min_size)
+            doc = fitz.open(file_path_to_use)
+        elif ext == '.docx':
+            image_data = extract_figures_from_docx(file_path_to_use, output_dir, min_size=min_size)
+            doc = docx.Document(file_path_to_use)
+        elif ext == '.pptx':
+            image_data = extract_figures_from_pptx(file_path_to_use, output_dir, min_size=min_size)
+            doc = Presentation(file_path_to_use)
+        elif ext in ('.html', '.htm'):
+            image_data = extract_figures_from_html(file_path_to_use, output_dir, min_size=min_size)
+            with open(file_path_to_use, 'r', encoding='utf-8') as f:
+                doc = BeautifulSoup(f, 'html.parser')
+        else:
+            try:
+                with open(file_path_to_use, 'r', encoding='utf-8') as f:
+                    _ = f.read(2048)
+                ext = '.html'
+                image_data = extract_figures_from_html(file_path_to_use, output_dir, min_size=min_size)
+                with open(file_path_to_use, 'r', encoding='utf-8') as f:
+                    doc = BeautifulSoup(f, 'html.parser')
+            except Exception:
+                raise ValueError(f"Unsupported or unrecognized file type for: {file_path}")
+
+        with open(output_file, "w", encoding="utf-8") as out:
+            for img_path, img_bytes, img_ext, context_id in image_data:
+                print(f"\nProcessing: {img_path}")
+                context_text = get_context(doc, context_id, ext)
+                description = azure_describe(img_bytes, img_ext, context_text)
+                out.write(f"{img_path}:\n{description}\n\n")
+
+        if ext == '.pdf':
+            doc.close()
+
+        print(f"\n✅ All results saved to: {output_file}")
+        print(f"✅ Extracted images saved under: {output_dir}")
+
+    finally:
+        if temp_file_to_remove and os.path.exists(temp_file_to_remove):
+            try:
+                os.remove(temp_file_to_remove)
+            except Exception:
+                pass
+
+
+# ======================
+# CONFIG / Run
+# ======================
+DOC_PATH = r"D:/Vrishabh/Personal Projects/PDF Extraction/test_docs/sample_test.pptx"
+process_document(DOC_PATH)
