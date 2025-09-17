@@ -16,17 +16,17 @@ This makes the app useful for research papers, business reports, educational mat
 # Usage
 
 1. Clone the repository and set up a Python environment:
-
+```bash
 python -m venv venv
 source venv/bin/activate  # On Windows use: venv\Scripts\activate
 pip install -r requirements.txt
-
+```
 2. Set your GOOGLE_API_KEY in the environment or a .env file if you want Gemini-based descriptions. Without it, you can still run extractions by enabling Dry run in the UI to skip AI calls.
 
 3. Run the Streamlit app:
-
+```bash
 streamlit run app.py
-
+```
 4. Open the Streamlit interface, upload a file or paste a URL, choose an extraction mode from the sidebar, and click Run Extraction. Results will be displayed interactively and can be downloaded.
 
 # Notes
