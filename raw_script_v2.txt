@@ -1,26 +1,34 @@
-# integrated_azure_multimodal.py
+import fitz
 import os
-import json
-import io
-import tempfile
-import requests
-import statistics
-import base64
-
-# file-type and document libs
-import fitz  # PyMuPDF
 from PIL import Image
-from zipfile import ZipFile
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
-import docx
-from pptx import Presentation
+import io
+import threading
+import time
 
-# env / db / creds
 from dotenv import load_dotenv
 load_dotenv()
 
+import docx
+from zipfile import ZipFile
+from pptx import Presentation
+from bs4 import BeautifulSoup
+import requests
+import tempfile
+import shutil
+import statistics
+from urllib.parse import urlparse
+
+import openai
+from openai import AzureOpenAI, AsyncAzureOpenAI
+import subprocess
+import asyncio
+import subprocess
+import os
 import psycopg2
+import json
+from psycopg.types.json import Jsonb
+import base64
+
 
 # ---------------------------
 # Load local credentials (must contain "db" dict)
@@ -72,28 +80,30 @@ azure_api_version = "2025-01-01-preview"
 # ---------------------------
 def azure_responses_multimodal(prompt_text: str, img_bytes: bytes, img_ext: str, max_tokens: int = 1024, temperature: float = 0.2):
     """
-    Send prompt_text + image (as data URL) to Azure Responses endpoint for your deployment.
-    Returns the assistant text response (string).
-    NOTE: This uses the Responses API path: /openai/deployments/{deployment}/responses?api-version={api_version}
-    The request body uses an 'input' array containing an object with a content array: text + image (data URL).
+    Try two Azure Responses shapes:
+      1) /openai/deployments/{deployment}/responses?api-version=...
+      2) /openai/responses?api-version=...  with "deployment" in JSON body
+    Returns the assistant text or raises ValueError with server messages.
     """
     if not azure_ad_token:
         raise ValueError("Azure AD token not available for Azure OpenAI calls.")
 
     base = azure_endpoint.rstrip('/')
-    url = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
+    url1 = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
+    url2 = f"{base}/openai/responses?api-version={azure_api_version}"
 
-    # Build data URL for image: data:image/{ext};base64,<b64>
-    # Normalize ext (e.g., 'jpeg' or 'png')
+    # Prepare image data URL
     ext = img_ext.lower().lstrip('.')
     if ext == 'jpg':
         ext = 'jpeg'
     mime = f"image/{ext}"
-    b64 = base64.b64encode(img_bytes).decode('ascii', errors='ignore')
+    try:
+        b64 = base64.b64encode(img_bytes).decode('ascii')
+    except Exception:
+        b64 = ""
     data_url = f"data:{mime};base64,{b64}"
 
-    # Construct body using content array with text and image object (supported shapes per docs/community examples)
-    body = {
+    body_path = {
         "input": [
             {
                 "role": "user",
@@ -103,31 +113,48 @@ def azure_responses_multimodal(prompt_text: str, img_bytes: bytes, img_ext: str,
                 ]
             }
         ],
-        # optional params
         "temperature": temperature,
         "max_tokens": max_tokens,
         "n": 1
     }
+    body_alt = dict(body_path)
+    body_alt["deployment"] = azure_deployment  # for the /openai/responses shape
 
     headers = {
         "Authorization": f"Bearer {azure_ad_token}",
         "Content-Type": "application/json"
     }
 
-    resp = requests.post(url, headers=headers, json=body, timeout=60)
-    if resp.status_code >= 400:
-        # attempt to include body for debugging in error message (trim)
-        raise ValueError(f"Azure Responses API error {resp.status_code}: {resp.text[:1000]}")
+    # Debug prints (masked token)
+    print("DEBUG: azure_endpoint:", azure_endpoint)
+    print("DEBUG: azure_deployment:", azure_deployment)
+    print("DEBUG: azure_api_version:", azure_api_version)
+    if azure_ad_token:
+        print("DEBUG: azure_ad_token prefix:", azure_ad_token[:8] + "... (length " + str(len(azure_ad_token)) + ")")
 
-    j = resp.json()
-    # Response parsing — Responses shape can vary; try common locations for generated text.
-    # Try: j['output'][0]['content'][0]['text'] OR j['choices'][0]['message']['content'] OR j['items']...
+    # Try URL1 first
+    resp1 = requests.post(url1, headers=headers, json=body_path, timeout=60)
+    if resp1.status_code == 404:
+        # try alternative shape
+        resp2 = requests.post(url2, headers=headers, json=body_alt, timeout=60)
+        if resp2.status_code >= 400:
+            # surface both responses for debugging
+            raise ValueError(
+                f"Azure Responses attempts failed.\n"
+                f"URL1 ({url1}) returned {resp1.status_code}: {resp1.text[:1200]}\n\n"
+                f"URL2 ({url2}) returned {resp2.status_code}: {resp2.text[:1200]}"
+            )
+        j = resp2.json()
+    elif resp1.status_code >= 400:
+        raise ValueError(f"Azure Responses API error {resp1.status_code}: {resp1.text[:1200]}")
+    else:
+        j = resp1.json()
+
+    # Extract text (robust heuristics)
     text = ""
     try:
-        # Newer Responses API often contains 'output' array with items containing content blocks
-        output = j.get("output") or j.get("outputs") or j.get("response") or None
+        output = j.get("output") or j.get("outputs") or None
         if output and isinstance(output, list):
-            # find first text block
             for o in output:
                 content = o.get("content") if isinstance(o, dict) else None
                 if content and isinstance(content, list):
@@ -137,29 +164,25 @@ def azure_responses_multimodal(prompt_text: str, img_bytes: bytes, img_ext: str,
                             break
                     if text:
                         break
-        # fallback: look for choices -> message
         if not text:
             choices = j.get("choices", [])
             if choices and isinstance(choices, list):
-                ch0 = choices[0]
-                # typical shapes:
-                text = ch0.get("text") or ch0.get("message", {}).get("content", "")
-        # last fallback: join any present strings in top-level fields
+                text = choices[0].get("text") or choices[0].get("message", {}).get("content", "")
         if not text:
-            # try to extract nested text fields heuristically
+            # fallback heuristic walk
             def walk_for_text(obj):
                 if isinstance(obj, str):
                     return obj
                 if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        res = walk_for_text(v)
-                        if res:
-                            return res
+                    for v in obj.values():
+                        r = walk_for_text(v)
+                        if r:
+                            return r
                 if isinstance(obj, list):
                     for item in obj:
-                        res = walk_for_text(item)
-                        if res:
-                            return res
+                        r = walk_for_text(item)
+                        if r:
+                            return r
                 return None
             text = walk_for_text(j) or ""
     except Exception:
@@ -168,20 +191,18 @@ def azure_responses_multimodal(prompt_text: str, img_bytes: bytes, img_ext: str,
     return text.strip()
 
 
-# ---------------------------
-# Simple fallback to text-only completions (if multimodal call fails)
-# ---------------------------
 def azure_text_completion(prompt_text: str, max_tokens: int = 1024, temperature: float = 0.2):
     """
-    Simple text-only fallback using the same Responses endpoint with only text input.
+    Text-only fallback — tries both endpoint shapes (deployment-in-path and deployment-in-body).
     """
     if not azure_ad_token:
         raise ValueError("Azure AD token not available for Azure OpenAI calls.")
 
     base = azure_endpoint.rstrip('/')
-    url = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
+    url1 = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
+    url2 = f"{base}/openai/responses?api-version={azure_api_version}"
 
-    body = {
+    body1 = {
         "input": [
             {
                 "role": "user",
@@ -194,17 +215,27 @@ def azure_text_completion(prompt_text: str, max_tokens: int = 1024, temperature:
         "max_tokens": max_tokens,
         "n": 1
     }
+    body2 = dict(body1)
+    body2["deployment"] = azure_deployment
 
     headers = {
         "Authorization": f"Bearer {azure_ad_token}",
         "Content-Type": "application/json"
     }
 
-    resp = requests.post(url, headers=headers, json=body, timeout=30)
-    if resp.status_code >= 400:
-        raise ValueError(f"Azure text Responses error {resp.status_code}: {resp.text[:1000]}")
-    j = resp.json()
-    # Extract text similar to multimodal parser
+    print("DEBUG: attempting text completion. URL1:", url1)
+    resp1 = requests.post(url1, headers=headers, json=body1, timeout=30)
+    if resp1.status_code == 404:
+        print("DEBUG: URL1 returned 404; trying URL2:", url2)
+        resp2 = requests.post(url2, headers=headers, json=body2, timeout=30)
+        if resp2.status_code >= 400:
+            raise ValueError(f"Azure text Responses error:\nURL1 ({url1}) {resp1.status_code}: {resp1.text[:1200]}\n\nURL2 ({url2}) {resp2.status_code}: {resp2.text[:1200]}")
+        j = resp2.json()
+    elif resp1.status_code >= 400:
+        raise ValueError(f"Azure text Responses error {resp1.status_code}: {resp1.text[:1200]}")
+    else:
+        j = resp1.json()
+
     text = ""
     try:
         choices = j.get("choices", [])
