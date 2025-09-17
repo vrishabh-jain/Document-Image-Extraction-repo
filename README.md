@@ -1,5 +1,5 @@
 # Document-Image-Extraction-repo
-This repo offers a single-file Streamlit app (app.py) that extracts images from PDFs, DOCX, PPTX, and HTML. It can optionally use Google Gemini (GenAI) to generate natural-language descriptions of figures, charts, and diagrams by analyzing surrounding context, combining parsing with AI insight.
+his repository provides a comprehensive single-file Streamlit application (app.py) that embeds a robust image extraction pipeline for multiple document types including PDFs, DOCX, PPTX, and HTML web pages. In addition to simply extracting embedded or inline images, the system can optionally integrate with Google Gemini (GenAI) to produce detailed natural language descriptions of each extracted figure, chart, or diagram by analyzing the surrounding context. The design goal is to combine flexible document parsing with AI-powered interpretability in a lightweight, deployable format.
 
 # Overview
 
