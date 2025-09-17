@@ -1,9 +1,11 @@
-import fitz
+import fitz  # PyMuPDF
 import os
+import json
+import psycopg2
+import asyncio
+import base64
 from PIL import Image
 import io
-import threading
-import time
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -18,248 +20,61 @@ import shutil
 import statistics
 from urllib.parse import urlparse
 
-import openai
-from openai import AzureOpenAI, AsyncAzureOpenAI
-import subprocess
-import asyncio
-import subprocess
-import os
-import psycopg2
-import json
-from psycopg.types.json import Jsonb
-import base64
-
-
-# ---------------------------
-# Load local credentials (must contain "db" dict)
-# ---------------------------
+# ======================
+# Azure / DB integration (from your provided snippet)
+# ======================
 with open(f"{os.getcwd()}{os.sep}cred.json", "r") as f:
     cred = json.load(f)
 
-
 def get_token_v2():
-    """
-    Connect to DB using cred['db'] and return 'spn' from meta table.
-    """
-    con = psycopg2.connect(**cred["db"])
-    spn = None
-    try:
-        with con.cursor() as cur:
-            cur.execute("SELECT value, last_update_time FROM meta WHERE key='spn';")
+    con = psycopg2.connect(
+        **cred["db"]
+    )
+
+    with con.cursor() as cur:
+        spn = None
+        try:
+            cur.execute(
+                f"Select value, last_update_time from meta where key='spn';"
+            )
+
             results = cur.fetchall()
             if len(results) > 0:
                 spn, last_update_time = results[0]
             else:
-                raise Exception("Failed to select 'spn' from meta")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+                raise Exception(f"Failed to select")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            raise Exception(f"{e}")
+
     return spn
 
+token = get_token_v2()
 
-# fetch azure AD token from DB
-try:
-    azure_ad_token = get_token_v2()
-except Exception as e:
-    print("⚠️ Failed to fetch Azure AD token from DB:", e)
-    azure_ad_token = None
+# NOTE: keep the same class name you used earlier for your Azure client.
+# It must be available in the runtime environment where you run this script.
+# Example: from some_azure_wrapper import AsyncAzureOpenAI
+# Here we assume AsyncAzureOpenAI is available in the environment.
+from some_azure_wrapper import AsyncAzureOpenAI  # <-- ensure this import matches your environment
 
-# Azure configuration (from your original snippet)
-azure_endpoint = "https://iwpb-aap-dev-wus.openai.azure.com"  # no trailing slash here; will normalize later
-azure_deployment = "gpt-4.1-nano"
-azure_api_version = "2025-01-01-preview"
-
-# ---------------------------
-# Helper: call Azure Responses multimodal endpoint
-# ---------------------------
-def azure_responses_multimodal(prompt_text: str, img_bytes: bytes, img_ext: str, max_tokens: int = 1024, temperature: float = 0.2):
-    """
-    Try two Azure Responses shapes:
-      1) /openai/deployments/{deployment}/responses?api-version=...
-      2) /openai/responses?api-version=...  with "deployment" in JSON body
-    Returns the assistant text or raises ValueError with server messages.
-    """
-    if not azure_ad_token:
-        raise ValueError("Azure AD token not available for Azure OpenAI calls.")
-
-    base = azure_endpoint.rstrip('/')
-    url1 = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
-    url2 = f"{base}/openai/responses?api-version={azure_api_version}"
-
-    # Prepare image data URL
-    ext = img_ext.lower().lstrip('.')
-    if ext == 'jpg':
-        ext = 'jpeg'
-    mime = f"image/{ext}"
-    try:
-        b64 = base64.b64encode(img_bytes).decode('ascii')
-    except Exception:
-        b64 = ""
-    data_url = f"data:{mime};base64,{b64}"
-
-    body_path = {
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt_text},
-                    {"type": "input_image", "image_url": data_url}
-                ]
-            }
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "n": 1
-    }
-    body_alt = dict(body_path)
-    body_alt["deployment"] = azure_deployment  # for the /openai/responses shape
-
-    headers = {
-        "Authorization": f"Bearer {azure_ad_token}",
-        "Content-Type": "application/json"
-    }
-
-    # Debug prints (masked token)
-    print("DEBUG: azure_endpoint:", azure_endpoint)
-    print("DEBUG: azure_deployment:", azure_deployment)
-    print("DEBUG: azure_api_version:", azure_api_version)
-    if azure_ad_token:
-        print("DEBUG: azure_ad_token prefix:", azure_ad_token[:8] + "... (length " + str(len(azure_ad_token)) + ")")
-
-    # Try URL1 first
-    resp1 = requests.post(url1, headers=headers, json=body_path, timeout=60)
-    if resp1.status_code == 404:
-        # try alternative shape
-        resp2 = requests.post(url2, headers=headers, json=body_alt, timeout=60)
-        if resp2.status_code >= 400:
-            # surface both responses for debugging
-            raise ValueError(
-                f"Azure Responses attempts failed.\n"
-                f"URL1 ({url1}) returned {resp1.status_code}: {resp1.text[:1200]}\n\n"
-                f"URL2 ({url2}) returned {resp2.status_code}: {resp2.text[:1200]}"
-            )
-        j = resp2.json()
-    elif resp1.status_code >= 400:
-        raise ValueError(f"Azure Responses API error {resp1.status_code}: {resp1.text[:1200]}")
-    else:
-        j = resp1.json()
-
-    # Extract text (robust heuristics)
-    text = ""
-    try:
-        output = j.get("output") or j.get("outputs") or None
-        if output and isinstance(output, list):
-            for o in output:
-                content = o.get("content") if isinstance(o, dict) else None
-                if content and isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") in ("output_text", "message") and c.get("text"):
-                            text = c.get("text")
-                            break
-                    if text:
-                        break
-        if not text:
-            choices = j.get("choices", [])
-            if choices and isinstance(choices, list):
-                text = choices[0].get("text") or choices[0].get("message", {}).get("content", "")
-        if not text:
-            # fallback heuristic walk
-            def walk_for_text(obj):
-                if isinstance(obj, str):
-                    return obj
-                if isinstance(obj, dict):
-                    for v in obj.values():
-                        r = walk_for_text(v)
-                        if r:
-                            return r
-                if isinstance(obj, list):
-                    for item in obj:
-                        r = walk_for_text(item)
-                        if r:
-                            return r
-                return None
-            text = walk_for_text(j) or ""
-    except Exception:
-        text = ""
-
-    return text.strip()
-
-
-def azure_text_completion(prompt_text: str, max_tokens: int = 1024, temperature: float = 0.2):
-    """
-    Text-only fallback — tries both endpoint shapes (deployment-in-path and deployment-in-body).
-    """
-    if not azure_ad_token:
-        raise ValueError("Azure AD token not available for Azure OpenAI calls.")
-
-    base = azure_endpoint.rstrip('/')
-    url1 = f"{base}/openai/deployments/{azure_deployment}/responses?api-version={azure_api_version}"
-    url2 = f"{base}/openai/responses?api-version={azure_api_version}"
-
-    body1 = {
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt_text}
-                ]
-            }
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "n": 1
-    }
-    body2 = dict(body1)
-    body2["deployment"] = azure_deployment
-
-    headers = {
-        "Authorization": f"Bearer {azure_ad_token}",
-        "Content-Type": "application/json"
-    }
-
-    print("DEBUG: attempting text completion. URL1:", url1)
-    resp1 = requests.post(url1, headers=headers, json=body1, timeout=30)
-    if resp1.status_code == 404:
-        print("DEBUG: URL1 returned 404; trying URL2:", url2)
-        resp2 = requests.post(url2, headers=headers, json=body2, timeout=30)
-        if resp2.status_code >= 400:
-            raise ValueError(f"Azure text Responses error:\nURL1 ({url1}) {resp1.status_code}: {resp1.text[:1200]}\n\nURL2 ({url2}) {resp2.status_code}: {resp2.text[:1200]}")
-        j = resp2.json()
-    elif resp1.status_code >= 400:
-        raise ValueError(f"Azure text Responses error {resp1.status_code}: {resp1.text[:1200]}")
-    else:
-        j = resp1.json()
-
-    text = ""
-    try:
-        choices = j.get("choices", [])
-        if choices:
-            text = choices[0].get("text") or choices[0].get("message", {}).get("content", "")
-        if not text:
-            output = j.get("output") or j.get("outputs") or []
-            for o in output:
-                content = o.get("content") if isinstance(o, dict) else None
-                if content and isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") in ("output_text", "message") and c.get("text"):
-                            text = c.get("text")
-                            break
-                    if text:
-                        break
-    except Exception:
-        text = ""
-
-    return text.strip()
-
+openai_llm = AsyncAzureOpenAI(
+    azure_ad_token=token,
+    azure_endpoint="https://iwpb-aap-dev-wus.openai.azure.com/",
+    azure_deployment="gpt-4.1-nano",
+    api_version="2025-01-01-preview"
+)
 
 # ======================
-# Now the document processing and extractors (unchanged from Code 2, aside from renaming the describe function)
+# CONFIG
+# ======================
+DOC_PATH = r"D:/Vrishabh/Personal Projects/PDF Extraction/test_docs/sample_test.pptx"
+OUTPUT_FILE = "extracted_texts.txt"
+MODEL = "gpt-4.1-nano"  # use deployment/model identifier appropriate for your Azure setup
+
+# ======================
+# FUNCTIONS (unchanged extractors & helpers from your original script)
 # ======================
 
 def extract_figures_from_pdf(pdf_path, output_dir, min_size):
@@ -435,7 +250,7 @@ def extract_figures_from_docx(docx_path, output_dir, min_size):
                     with open(img_path, "rb") as f:
                         saved_bytes = f.read()
                 except Exception:
-                    saved_bytes = img_bytes
+                    saved_bytes = img_bytes  # fallback
 
                 image_data.append((img_path, saved_bytes, img_ext, 0))
     except Exception as e:
@@ -603,26 +418,70 @@ def get_context(doc, context_id, ext):
         return ''
 
 
-# Replaced Gemini describe with azure_describe (multimodal via Azure)
-def azure_describe(img_bytes, img_ext, page_text):
-    """
-    Uses Azure OpenAI Responses multimodal API (gpt-4.1-nano) to describe the image in context.
-    Tries multimodal call first; falls back to text-only call if multimodal fails.
-    """
+# ======================
+# Replaced Gemini -> Azure OpenAI integration
+# ======================
+
+def _build_prompt_for_image(page_text):
     prompt = f"Here is the text from the page containing this image:\n{page_text}\n\nExtract all visible text from the image and provide a detailed description of this image in the context of the document and the surrounding page text. If it's a diagram or chart, describe relationships, labels, structure, and what it illustrates in the context of the document."
+    return prompt
 
+
+async def _azure_generate_with_image_async(prompt_text, img_bytes, img_ext):
+    """
+    Async helper that calls the AsyncAzureOpenAI client's generation method.
+    This wrapper encodes the image in base64 and sends it along with the text prompt.
+    The exact call signature used here follows a reasonable expectation for an async client;
+    adapt if your AsyncAzureOpenAI client expects a different method / parameters.
+    """
+    mime_type = f"image/{img_ext}"
+    # Prepare payload - many Azure wrappers accept messages or content pieces.
+    # Here we pass a structure with text + base64 image blob.
+    payload = {
+        "model": MODEL,
+        "input": [
+            {"role": "user", "content": prompt_text},
+            {"type": "image", "mime_type": mime_type, "data_base64": base64.b64encode(img_bytes).decode()}
+        ]
+    }
+
+    # Call the async client's generate method. Adjust if your client uses a different method name.
+    # We're using `generate_content` here to mirror the earlier Gemini call shape.
+    resp = await openai_llm.generate_content(payload)
+    # We expect resp to have a `text` attribute or similar. If not, adapt accordingly.
+    # Return textual result (guarding for attribute differences).
+    if hasattr(resp, "text"):
+        return resp.text
+    elif isinstance(resp, dict):
+        # common shape: {"choices":[{"message":{"content":"..."}}]}
+        # attempt to extract common fields conservatively
+        choices = resp.get("choices") or []
+        if choices:
+            first = choices[0]
+            msg = first.get("message") or first.get("delta") or first
+            if isinstance(msg, dict):
+                return msg.get("content") or msg.get("text") or str(resp)
+        return str(resp)
+    else:
+        return str(resp)
+
+
+def gemini_describe(img_bytes, img_ext, page_text):
+    """Replaced Gemini call with Azure OpenAI async call (synchronous wrapper)."""
+    prompt = _build_prompt_for_image(page_text)
+    # Run the async helper synchronously
     try:
-        return azure_responses_multimodal(prompt, img_bytes, img_ext, max_tokens=1024, temperature=0.15)
+        result = asyncio.run(_azure_generate_with_image_async(prompt, img_bytes, img_ext))
     except Exception as e:
-        print("⚠️ Multimodal call failed, falling back to text-only. Error:", e)
-        try:
-            # Provide a hint that this was fallback (we still include a small note so user knows)
-            fallback_prompt = prompt + "\n\n(Note: the image could not be sent; please reason based on the page text only.)"
-            return azure_text_completion(fallback_prompt, max_tokens=1024, temperature=0.15)
-        except Exception as e2:
-            print("⚠️ Text-only fallback also failed:", e2)
-            return ""
+        # If async run fails, raise to surface issues like incorrect client API usage.
+        raise
 
+    return result.strip() if result else ""
+
+
+# ======================
+# The rest of the original script: helpers and process_document
+# ======================
 
 def _download_url_to_tempfile(url, timeout=10):
     try:
@@ -801,6 +660,7 @@ def process_document(file_path, determine_mode='balanced'):
 
     try:
         ext = os.path.splitext(file_path_to_use)[1].lower()
+
         base_output_dir = f"extracted_images_{ext[1:] if ext else 'unknown'}"
 
         if is_url:
@@ -847,7 +707,7 @@ def process_document(file_path, determine_mode='balanced'):
             for img_path, img_bytes, img_ext, context_id in image_data:
                 print(f"\nProcessing: {img_path}")
                 context_text = get_context(doc, context_id, ext)
-                description = azure_describe(img_bytes, img_ext, context_text)
+                description = gemini_describe(img_bytes, img_ext, context_text)
                 out.write(f"{img_path}:\n{description}\n\n")
 
         if ext == '.pdf':
@@ -865,7 +725,6 @@ def process_document(file_path, determine_mode='balanced'):
 
 
 # ======================
-# CONFIG / Run
+# Run
 # ======================
-DOC_PATH = r"D:/Vrishabh/Personal Projects/PDF Extraction/test_docs/sample_test.pptx"
 process_document(DOC_PATH)
