@@ -6,7 +6,7 @@ This repository provides a comprehensive single-file Streamlit application (app.
 This Streamlit application provides an end-to-end workflow for document image analysis. Key capabilities include:
 
 1. Uploading local files or processing remote URLs for supported formats (PDF, DOCX, PPTX, HTML).
-2. Extracting all embedded images while automatically filtering out small or low-quality images via a dynamic min_size threshold computed from the document’s own contents.
+2. Extracting all embedded images while automatically filtering out small or low-quality images via a dynamic **min_size** threshold computed from the document’s own contents.
 3. Optionally generating semantic descriptions for each extracted image using Google Gemini (GenAI), leveraging the surrounding document text for contextual accuracy.
 4. Displaying extracted images side by side with AI-generated descriptions in the web interface.
 5. Downloading all results, including images and a text file of descriptions, packaged neatly as a ZIP archive.
@@ -21,7 +21,7 @@ python -m venv venv
 source venv/bin/activate  # On Windows use: venv\Scripts\activate
 pip install -r requirements.txt
 ```
-2. Set your GOOGLE_API_KEY in the environment or a .env file if you want Gemini-based descriptions. Without it, you can still run extractions by enabling Dry run in the UI to skip AI calls.
+2. Set your **GOOGLE_API_KEY** in the environment or a **.env** file if you want Gemini-based descriptions. Without it, you can still run extractions by enabling Dry run in the UI to skip AI calls.
 
 3. Run the Streamlit app:
 ```bash
