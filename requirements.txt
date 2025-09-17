@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+requests
+beautifulsoup4
+pillow
+pymupdf
+python-pptx
+python-docx
+google-genai
