@@ -1,0 +1,51 @@
+def list_attachments_via_api(self, page_id: str, limit: int = 100):
+    """
+    Use Confluence REST API to list attachments for a given page.
+    Returns a list of attachment metadata dicts.
+    """
+    attachments = []
+    start = 0
+    while True:
+        url = f"{self.base_url}/rest/api/content/{page_id}/child/attachment?start={start}&limit={limit}"
+        resp = self.session.get(url, proxies=self.proxies, verify=self.verify)
+        if resp.status_code != 200:
+            print(f"Failed to list attachments: {resp.status_code} {resp.text[:200]}")
+            break
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            break
+        attachments.extend(results)
+        if len(results) < limit:
+            break
+        start += limit
+    return attachments
+
+
+def download_attachments_via_api(self, page_id: str, dest_folder: str):
+    """
+    Uses the Confluence REST API to list and download all attachments for a page.
+    Returns dict: attachment_id -> local_path (or None if failed).
+    """
+    Path(dest_folder).mkdir(parents=True, exist_ok=True)
+    attachments = self.list_attachments_via_api(page_id)
+    print(f"Found {len(attachments)} attachments on page {page_id}")
+
+    downloaded = {}
+    for att in attachments:
+        att_id = att.get("id")
+        att_title = att.get("title")
+        download_rel = att.get("_links", {}).get("download")
+        if not download_rel:
+            print(f"No download link for attachment {att_id} ({att_title})")
+            downloaded[att_id] = None
+            continue
+
+        download_url = urljoin(self.base_url, download_rel)
+        local_path = self.download_attachment(download_url, dest_folder)
+        downloaded[att_id] = local_path
+        if local_path:
+            print(f"Downloaded attachment {att_title} -> {local_path}")
+        else:
+            print(f"Failed to download attachment {att_title}")
+    return downloaded
