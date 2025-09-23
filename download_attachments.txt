@@ -1,0 +1,213 @@
+# fetch_confluence_data.py
+import os
+from urllib.parse import urljoin, urlparse
+import requests
+from pathlib import Path
+from bs4 import BeautifulSoup
+
+from config_provider import ConfigProvider
+from get_confluence_content import GetConfluenceContent
+
+
+class FetchConfluenceData:
+    def __init__(self, confluence_url, page_id):
+        self.config_provider = ConfigProvider()
+        self.confluence_content = GetConfluenceContent(confluence_url, page_id)
+        self.base_url = confluence_url  # used for resolving relative links
+        # Prepare a requests.Session reusing auth/headers/proxies
+        self.session = requests.Session()
+        self.session.auth = getattr(self.config_provider, "auth", None)
+        if getattr(self.config_provider, "headers", None):
+            self.session.headers.update(self.config_provider.headers)
+        self.proxies = getattr(self.config_provider, "proxy", None)
+        # keep verify consistent with your other code (change to True in prod)
+        self.verify = False
+
+    def getPageContent(self):
+        """
+        Returns (page_name, list_of_table_elements) or (None, []) on failure.
+        """
+        page_soup = self.confluence_content.get_page_as_html()
+        if not page_soup:
+            print("Warning: get_page_as_html() returned no content.")
+            return None, []
+
+        # page_soup is expected to be a dict {page_title: BeautifulSoup_obj}
+        page_name = list(page_soup.keys())[0]
+        soup = page_soup.get(page_name)
+        if soup is None:
+            return page_name, []
+
+        tables = soup.find_all("table")
+        return page_name, tables
+
+    def getConfluenceData(self):
+        """
+        Parse tables and return list of row dicts (header->cell).
+        This function does not download attachments - only parses tables.
+        """
+        _, tables = self.getPageContent()
+        all_rows = []
+
+        for table in tables:
+            # Safely extract header row (first tr with th elements)
+            header_row = None
+            for tr in table.find_all("tr"):
+                ths = tr.find_all("th")
+                if ths:
+                    header_row = tr
+                    break
+            if not header_row:
+                # No header row found, skip this table
+                continue
+
+            headers = [h.get_text(strip=True) for h in header_row.find_all("th")]
+
+            # Data rows are trs after the header_row
+            rows = []
+            started = False
+            for tr in table.find_all("tr"):
+                if tr is header_row:
+                    started = True
+                    continue
+                if not started:
+                    continue
+                tds = tr.find_all("td")
+                if not tds:
+                    continue
+                row_data = {}
+                for i, header in enumerate(headers):
+                    value = tds[i].get_text(strip=True) if i < len(tds) else ""
+                    row_data[header] = value
+                all_rows.append(row_data)
+
+        return all_rows
+
+    def _find_attachment_links_in_soup(self, soup: BeautifulSoup):
+        """
+        Return a list of absolute URLs that look like attachment download links.
+        Typical patterns: '/download/attachments/<id>/file.ext' or '/download/resources/...' etc.
+        """
+        links = set()
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            # choose patterns likely to be attachments - common Confluence patterns include:
+            # '/download/attachments/', '/download/resources/', sometimes direct '/rest/api/content/{id}/child/attachment' links
+            if '/download/attachments/' in href or '/download/resources/' in href or '/download/attachments' in href or '/attachments/' in href:
+                absolute = urljoin(self.base_url, href)
+                links.add(absolute)
+        return list(links)
+
+    def _safe_filename_from_url(self, url):
+        """
+        Extract a safe filename from the URL or its query, minimal sanitization.
+        """
+        parsed = urlparse(url)
+        name = os.path.basename(parsed.path) or parsed.netloc
+        # remove query params from name, replace path separators, strip whitespace
+        name = name.split('?')[0].strip()
+        # sanitize some problematic characters
+        for ch in ('/', '\\', ':', '*', '?', '"', '<', '>', '|'):
+            name = name.replace(ch, '_')
+        # fallback
+        if not name:
+            name = "attachment.bin"
+        return name
+
+    def download_attachment(self, download_url: str, dest_folder: str):
+        """
+        Downloads a single attachment URL to dest_folder and returns local path.
+        Uses session.auth and session.headers already configured.
+        """
+        Path(dest_folder).mkdir(parents=True, exist_ok=True)
+
+        # Request the file (streamed)
+        with self.session.get(download_url, stream=True, proxies=self.proxies, verify=self.verify) as r:
+            try:
+                r.raise_for_status()
+            except Exception as e:
+                # bubble up or convert to return None
+                print(f"Failed to fetch {download_url} : {e}")
+                return None
+
+            # prefer filename from Content-Disposition if present
+            cd = r.headers.get('content-disposition')
+            filename = None
+            if cd and 'filename=' in cd:
+                filename = cd.split('filename=')[-1].strip(' "\'')
+            if not filename:
+                filename = self._safe_filename_from_url(download_url)
+
+            out_path = os.path.join(dest_folder, filename)
+            # if file exists, append a numeric suffix to avoid overwrite
+            base, ext = os.path.splitext(out_path)
+            counter = 1
+            while os.path.exists(out_path):
+                out_path = f"{base}({counter}){ext}"
+                counter += 1
+
+            # write streamed content
+            with open(out_path, 'wb') as fh:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        fh.write(chunk)
+        return out_path
+
+    def download_attachments_from_page(self, dest_folder: str):
+        """
+        Find attachment links in the page HTML (export_view or storage) and download each.
+        Returns a dict mapping download_url -> local_path (or None on download failure).
+        """
+        page_soup = self.confluence_content.get_page_as_html()
+        if not page_soup:
+            print("No page HTML available to search for attachments.")
+            return {}
+
+        page_name = list(page_soup.keys())[0]
+        soup = page_soup.get(page_name)
+        if soup is None:
+            print("No parsed soup available.")
+            return {}
+
+        links = self._find_attachment_links_in_soup(soup)
+        if not links:
+            # Try the export view as a fallback (some attachments might be present there)
+            export_soup = self.confluence_content.get_page_export_view_as_html()
+            if export_soup:
+                # export_soup might be a BeautifulSoup object directly in your implementation
+                if isinstance(export_soup, dict):  # keep compatibility if exported differently
+                    # take first value
+                    export_obj = list(export_soup.values())[0]
+                else:
+                    export_obj = export_soup
+                links = self._find_attachment_links_in_soup(export_obj)
+
+        downloaded_map = {}
+        for link in links:
+            local = self.download_attachment(link, dest_folder)
+            downloaded_map[link] = local
+            if local:
+                print(f"Downloaded {link} -> {local}")
+            else:
+                print(f"Failed to download {link}")
+
+        return downloaded_map
+
+
+if __name__ == "__main__":
+    # Update these values as needed
+    CONFLUENCE_API_BASE = "https://confluence/rest/api/content"
+    PAGE_ID = "131299092"
+    DEST_FOLDER = "downloads/confluence_attachments"
+
+    f = FetchConfluenceData(confluence_url=CONFLUENCE_API_BASE, page_id=PAGE_ID)
+
+    # 1) Parse tables (existing behavior)
+    table_rows = f.getConfluenceData()
+    print("Parsed rows:")
+    print(table_rows)
+
+    # 2) Download only attachments referenced from the same page
+    downloaded = f.download_attachments_from_page(DEST_FOLDER)
+    print("Downloaded attachment mapping (url -> local path):")
+    print(downloaded)
