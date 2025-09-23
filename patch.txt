@@ -1,0 +1,128 @@
+import re
+from urllib.parse import urljoin, urlparse
+
+# Replace the existing _find_attachment_links_in_soup with this:
+def _find_attachment_links_in_soup(self, soup: BeautifulSoup):
+    """
+    More robust discovery of attachment URLs inside a BeautifulSoup 'soup' object.
+    Returns a list of absolute URLs (using self.base_url).
+    """
+    found = set()
+
+    # 1) Common tags with href/src/data attributes
+    for tag in soup.find_all(['a', 'img', 'object', 'embed', 'iframe']):
+        href = tag.get('href') or tag.get('src') or tag.get('data') or ''
+        if not href:
+            # check some common data- attributes that Confluence sometimes uses
+            for attr in ('data-attachment', 'data-linked-resource', 'data-src', 'data-full-url'):
+                if tag.has_attr(attr):
+                    href = tag[attr]
+                    break
+        if not href:
+            continue
+        href = href.strip()
+        # pick up anything that looks like attachment/resource REST or download URL
+        if any(token in href for token in ['/download/attachments/', '/download/resources/', '/attachments/', '/rest/api/content/']):
+            found.add(urljoin(self.base_url, href))
+
+    # 2) Search for ri:attachment or ri:filename attributes (Confluence storage format)
+    #    Many export views will contain tags like <ri:attachment ri:filename="file.pdf" />
+    #    BeautifulSoup treats names with ':' as tag/attr names, so inspect attributes of all tags.
+    for tag in soup.find_all(True):
+        # Look for attributes that indicate an attachment or filename
+        for attr_name, attr_val in tag.attrs.items():
+            # attr_name could be 'ri:filename' or similar
+            if 'ri:filename' in attr_name or attr_name.endswith(':filename') or 'attachment' in attr_name:
+                # try to locate an anchor nearby with href
+                parent_a = tag.find_parent('a')
+                if parent_a and parent_a.get('href'):
+                    found.add(urljoin(self.base_url, parent_a.get('href')))
+                else:
+                    # fallback: the filename may appear somewhere else in HTML; use regex fallback below
+                    pass
+
+    # 3) Regex fallback on raw HTML (covers embedded links inside data attributes / JS)
+    raw = str(soup)
+    # pattern matches absolute or relative URLs that include download/attachments or download/resources
+    pattern = r'(https?://[^\'" >]*?/download/(?:attachments|resources)/[^\'" >]+)|(/download/(?:attachments|resources)/[^\'" >]+)'
+    for m in re.finditer(pattern, raw):
+        absolute = m.group(1) or m.group(2)
+        if absolute:
+            found.add(urljoin(self.base_url, absolute))
+
+    # 4) Some pages store attachments in /download/attachments/<id>/<filename>?api=... or with query params
+    # handle any leftover '/attachments/' occurrences (e.g., '/attachments/12345/file.pdf')
+    pattern2 = r'(https?://[^\'" >]*?/attachments/[^\'" >]+)|(/attachments/[^\'" >]+)'
+    for m in re.finditer(pattern2, raw):
+        u = m.group(1) or m.group(2)
+        if u:
+            found.add(urljoin(self.base_url, u))
+
+    # Convert set to sorted list for deterministic ordering
+    links = sorted(found)
+    # Debug print
+    if links:
+        print("DEBUG: found attachment candidate links:")
+        for l in links:
+            print("  -", l)
+    else:
+        print("DEBUG: no attachment links found in soup")
+
+    return links
+
+
+# Replace download_attachments_from_page with this improved version:
+def download_attachments_from_page(self, dest_folder: str):
+    """
+    Uses the robust finder above to locate attachment links in storage HTML and export_view HTML and downloads them.
+    Returns dict mapping download_url -> local_path (or None on failure).
+    """
+    # Try storage view first
+    page_soup = self.confluence_content.get_page_as_html()
+    if not page_soup:
+        print("No page HTML (storage) available to search for attachments.")
+        return {}
+
+    page_name = list(page_soup.keys())[0]
+    soup = page_soup.get(page_name)
+    links = []
+    if soup is not None:
+        links = self._find_attachment_links_in_soup(soup)
+
+    # If nothing found, try export_view HTML (some attachments only appear there)
+    if not links:
+        try:
+            export_soup = self.confluence_content.get_page_export_view_as_html()
+            # export_soup might be a BeautifulSoup or a dict depending on implementation
+            if export_soup:
+                if isinstance(export_soup, dict):
+                    # take first value
+                    export_obj = list(export_soup.values())[0]
+                else:
+                    export_obj = export_soup
+                links = self._find_attachment_links_in_soup(export_obj)
+        except Exception as e:
+            print("Warning: error while trying export_view fallback:", e)
+
+    # Final fallback: also try scanning the raw JSON response bodies for download links
+    if not links:
+        # try reading raw HTML string of storage if available
+        raw_html = str(soup) if soup else ""
+        # quick regex to pick up /download/attachments/... occurrences
+        for m in re.finditer(r'(https?://[^\'" >]*?/download/(?:attachments|resources)/[^\'" >]+)|(/download/(?:attachments|resources)/[^\'" >]+)', raw_html):
+            u = m.group(1) or m.group(2)
+            links.append(urljoin(self.base_url, u))
+
+    # Deduplicate
+    links = sorted(set(links))
+
+    downloaded_map = {}
+    for link in links:
+        local = self.download_attachment(link, dest_folder)
+        downloaded_map[link] = local
+        if local:
+            print(f"Downloaded {link} -> {local}")
+        else:
+            print(f"Failed to download {link}")
+
+    return downloaded_map
