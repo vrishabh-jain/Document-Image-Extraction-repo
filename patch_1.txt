@@ -1,0 +1,47 @@
+def extract_and_save_links(self, dest_folder: str, page_id: str):
+    """
+    Scans the page HTML for links.
+    - Downloads actual attachments/files (pdf, pptx, etc.)
+    - Collects other links (Jira, Confluence pages, GitHub, external sites)
+    Returns a dict with two keys:
+        {
+            "files": { source -> local_path },
+            "links": { "jira": [...], "confluence": [...], "github": [...], "external": [...] }
+        }
+    """
+    results = {"files": {}, "links": {"jira": [], "confluence": [], "github": [], "external": []}}
+
+    # Step 1: Run your existing deduped download
+    files_map = self.download_api_then_page_with_head_dedupe(page_id, dest_folder)
+    results["files"].update(files_map)
+
+    # Step 2: Parse HTML again for links
+    page_soup_dict = self.confluence_content.get_page_as_html()
+    if not page_soup_dict:
+        return results
+
+    page_name = list(page_soup_dict.keys())[0]
+    soup = page_soup_dict.get(page_name)
+    if not soup:
+        return results
+
+    # Collect all <a href> links
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        abs_url = urljoin(self.base_url, href)
+
+        # Skip if already downloaded as file
+        if abs_url in results["files"]:
+            continue
+
+        # Classify
+        if "jira" in abs_url.lower():
+            results["links"]["jira"].append(abs_url)
+        elif "confluence" in abs_url.lower():
+            results["links"]["confluence"].append(abs_url)
+        elif "github.com" in abs_url.lower():
+            results["links"]["github"].append(abs_url)
+        else:
+            results["links"]["external"].append(abs_url)
+
+    return results
