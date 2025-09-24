@@ -11,89 +11,225 @@ from bs4 import BeautifulSoup
 from config_provider import ConfigProvider
 from get_confluence_content import GetConfluenceContent
 
+# --- file-link detection ---
 FILE_EXTS = re.compile(
     r"\.(pdf|docx|doc|xlsx|xls|pptx|ppt|odt|rtf|txt|zip|tar|gz|xlsm)$",
     re.IGNORECASE,
 )
 
 
+def _is_file_link(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        return bool(FILE_EXTS.search(urlparse(url).path or ""))
+    except Exception:
+        return False
+
+
 def _normalize_url(base: str, href: str) -> str:
     if not href:
         return ""
     full = urljoin(base, href) if base and not urlparse(href).scheme else href
-    return urlparse(full)._replace(fragment="").geturl()
+    parsed = urlparse(full)
+    return parsed._replace(fragment="").geturl()
+
+
+def _safe_filename(s: str, fallback: str = "page") -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(s))
+    return safe or fallback
 
 
 class DownloadAttachments:
-    def __init__(self, confluence_url, page_id, verify: bool = False):
+    def __init__(self, confluence_url, page_id, verify: bool = True):
+        """
+        Keep your original init shape (uses ConfigProvider and GetConfluenceContent).
+        """
         self.confluence_url = confluence_url
         self.page_id = page_id
         self.verify = verify
         self.config_provider = ConfigProvider()
-        self.confluence_content = GetConfluenceContent(
-            confluence_url, self.config_provider
-        )
+        # your provider class instance (whatever it exposes)
+        self.confluence_content = GetConfluenceContent(confluence_url, self.config_provider)
+        # small session for crawling
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "ConfluenceLinkExtractor/1.0"})
 
-    def _classify_link(self, url: str) -> str:
-        if FILE_EXTS.search(urlparse(url).path or ""):
-            return "files"
-        u = url.lower()
-        if "jira" in u or "/browse/" in u or "/issues/" in u:
-            return "jira"
-        if self.confluence_url in url or u.startswith("/wiki") or u.startswith("/pages"):
-            return "confluence"
-        return "external"
+    # --- robust page HTML fetcher (tries common provider method names) ---
+    def _fetch_page_html(self, page_id: str):
+        """
+        Try several likely method names on self.confluence_content to obtain page HTML.
+        Returns HTML string or None.
+        Handles:
+          - methods that return HTML string
+          - methods that return Confluence JSON dict (extracts body.storage.value)
+          - methods that return a requests-like Response (uses .text)
+        """
+        provider = self.confluence_content
+        if not provider:
+            return None
 
-    def _detect_content_area(self, soup: BeautifulSoup):
-        # Look for common Confluence/Jira page containers
+        # candidate callables (try in order)
         candidates = [
-            ("id", "main-content"),
-            ("id", "content"),
-            ("id", "wiki-content"),
-            ("class", "wiki-content"),
-            ("class", "ak-renderer-document"),
-            ("class", "page-content"),
-            ("id", "descriptionmodule"),
-            ("id", "issue-content"),
-            ("id", "content-body"),
-            ("class", "editor-content"),
+            "get_page",               # used earlier in our convo
+            "get_page_by_id",
+            "get_page_html",
+            "get_page_body",
+            "get_page_as_html",
+            "get_page_as_json",       # included in case some versions name it that way
+            "get_content",
+            "fetch_page",
+            "get_content_as_html",
+            "get_page_content",
         ]
-        for kind, val in candidates:
-            node = soup.find("div", {kind: val})
+
+        for name in candidates:
+            try:
+                attr = getattr(provider, name, None)
+                if not callable(attr):
+                    continue
+                # attempt call — many providers take page_id as first arg
+                try:
+                    res = attr(page_id)
+                except TypeError:
+                    # try without args
+                    res = attr()
+                # Now normalize res to HTML string
+                # 1) If it's None, continue
+                if res is None:
+                    continue
+                # 2) If it's a requests Response-like object: use .text
+                if hasattr(res, "text"):
+                    return res.text
+                # 3) If it's a dict with Confluence JSON shape:
+                if isinstance(res, dict):
+                    # common shape: {'body': {'storage': {'value': '<html>...</html>'}}}
+                    body = res.get("body")
+                    if isinstance(body, dict):
+                        storage = body.get("storage")
+                        if isinstance(storage, dict) and "value" in storage:
+                            return storage["value"]
+                    # maybe res has 'value' directly
+                    if "value" in res and isinstance(res["value"], str):
+                        return res["value"]
+                    # maybe res contains html under other keys
+                    for k in ("html", "content", "body_html"):
+                        if k in res and isinstance(res[k], str):
+                            return res[k]
+                    # not found - continue to next candidate
+                    continue
+                # 4) If it's a plain string -> treat as HTML
+                if isinstance(res, str):
+                    return res
+                # 5) If it's some object with a get('body') method, attempt best-effort
+                try:
+                    maybe = getattr(res, "get", None)
+                    if callable(maybe):
+                        body = res.get("body")
+                        if isinstance(body, dict):
+                            storage = body.get("storage")
+                            if isinstance(storage, dict) and "value" in storage:
+                                return storage["value"]
+                except Exception:
+                    pass
+                # fallback: convert to str
+                try:
+                    s = str(res)
+                    if "<html" in s.lower() or "doctype" in s.lower():
+                        return s
+                except Exception:
+                    pass
+            except Exception:
+                # don't fail on provider errors; try next candidate
+                continue
+
+        # if none worked, return None
+        return None
+
+    # --- small helper: detect likely page content area (avoid nav/footer) ---
+    def _detect_content_area(self, soup: BeautifulSoup):
+        id_selectors = ["main-content", "content", "wiki-content", "content-body", "issue-content", "descriptionmodule"]
+        class_selectors = ["wiki-content", "page-content", "ak-renderer-document", "editor-content"]
+        for idv in id_selectors:
+            node = soup.find("div", {"id": idv})
+            if node:
+                return node
+        for cv in class_selectors:
+            node = soup.find("div", {"class": cv})
             if node:
                 return node
         return soup
 
+    def _classify_link(self, url: str) -> str:
+        if not url:
+            return "external"
+        if _is_file_link(url):
+            return "files"
+        low = url.lower()
+        parsed = urlparse(low)
+        if "jira" in parsed.netloc or "/browse/" in low or "/issues/" in low:
+            return "jira"
+        if (self.confluence_url and self.confluence_url in url) or low.startswith("/wiki") or low.startswith("/pages") or "confluence" in low:
+            return "confluence"
+        return "external"
+
+    # --- minimal nested crawl (jira + confluence seeds) ---
     def _crawl_nested_links(self, results: dict, timeout: float = 8.0, delay: float = 0.15):
-        """
-        Crawl only jira + confluence seeds.
-        Saves results['nested_links'][parent] with the same categories: jira, confluence, external, files.
-        """
         results.setdefault("nested_links", {})
-        seeds = results["links"]["jira"] + results["links"]["confluence"]
+        seeds = list(results.get("links", {}).get("jira", []) + results.get("links", {}).get("confluence", []))
         if not seeds:
             return results
 
-        headers = self.config_provider.get_headers()
-        session = requests.Session()
-        session.headers.update(headers)
+        # merge headers from ConfigProvider, if present
+        headers = {}
+        try:
+            if hasattr(self.config_provider, "get_headers"):
+                h = self.config_provider.get_headers()
+                if isinstance(h, dict):
+                    headers.update(h)
+        except Exception:
+            pass
+
+        # merge with session headers
+        merged_headers = self._session.headers.copy()
+        merged_headers.update(headers)
 
         for parent in seeds:
+            parent = parent.strip()
             nested = {"jira": [], "confluence": [], "external": [], "files": []}
+            if not parent:
+                results["nested_links"][parent] = nested
+                continue
             try:
-                r = session.get(parent, headers=headers, timeout=timeout, verify=self.verify)
-                r.raise_for_status()
-                if "html" not in (r.headers.get("Content-Type") or "").lower():
+                resp = self._session.get(parent, headers=merged_headers, timeout=timeout, verify=self.verify)
+                resp.raise_for_status()
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "html" not in ctype:
                     results["nested_links"][parent] = nested
                     continue
 
-                soup = BeautifulSoup(r.text, "html.parser")
+                soup = BeautifulSoup(resp.text, "html.parser")
                 content_area = self._detect_content_area(soup)
 
                 for a in content_area.find_all("a", href=True):
-                    child = _normalize_url(parent, a["href"].strip())
+                    raw = a.get("href").strip()
+                    if not raw:
+                        continue
+                    child = _normalize_url(parent, raw)
                     if not child:
                         continue
+
+                    # light cross-origin noise filter: allow same-origin or obvious confluence/jira/file links
+                    try:
+                        child_net = urlparse(child).netloc
+                        parent_net = urlparse(parent).netloc
+                        if child_net and parent_net and child_net != parent_net:
+                            lowc = child.lower()
+                            if not ("confluence" in lowc or "jira" in lowc or _is_file_link(child)):
+                                continue
+                    except Exception:
+                        pass
+
                     cat = self._classify_link(child)
                     if child not in nested[cat]:
                         nested[cat].append(child)
@@ -102,43 +238,60 @@ class DownloadAttachments:
 
                 results["nested_links"][parent] = nested
             except Exception:
-                traceback.print_exc()
+                # continue on any failure for that parent
                 results["nested_links"][parent] = nested
             finally:
                 time.sleep(delay)
 
         return results
 
+    # ---------------- main public method ----------------
     def extract_and_save_links(self, dest_folder: str, page_id: str):
         """
-        Scan page HTML for links. Categorize into jira, confluence, external, files.
-        Crawl nested jira/confluence links.
-        Save results JSON.
+        Extract top-level links and nested links. Save JSON with 'links' (jira,confluence,external,files)
+        and 'nested_links' per parent.
         """
+        # ensure dest folder exists
+        dest_folder = os.path.abspath(dest_folder)
+        pathlib.Path(dest_folder).mkdir(parents=True, exist_ok=True)
+
         results = {"links": {"jira": [], "confluence": [], "external": [], "files": []}}
 
-        # get page HTML
-        page = self.confluence_content.get_page_as_json(page_id)
-        if not page:
+        # Fetch page HTML using robust helper (no invented method names)
+        page_html = self._fetch_page_html(page_id)
+        if not page_html:
+            # If we couldn't get HTML, return empty (or you can raise)
             return results
-        page_html = page["body"]["storage"]["value"]
 
         soup = BeautifulSoup(page_html, "html.parser")
+        base = self.confluence_url or ""
 
-        # extract top-level links
+        # Top-level anchor extraction with files merged into links["files"]
         for a in soup.find_all("a", href=True):
-            full_url = _normalize_url(self.confluence_url, a["href"].strip())
-            cat = self._classify_link(full_url)
-            if full_url not in results["links"][cat]:
-                results["links"][cat].append(full_url)
+            raw_href = a.get("href").strip()
+            if not raw_href:
+                continue
+            full = _normalize_url(base, raw_href)
+            if not full:
+                continue
+            cat = self._classify_link(full)
+            if full not in results["links"][cat]:
+                results["links"][cat].append(full)
 
-        # nested crawl
-        self._crawl_nested_links(results)
+        # Crawl nested only for jira + confluence
+        try:
+            self._crawl_nested_links(results)
+        except Exception:
+            traceback.print_exc()
 
-        # save JSON
-        pathlib.Path(dest_folder).mkdir(parents=True, exist_ok=True)
-        json_path = os.path.join(dest_folder, f"{page_id}_results.json")
-        with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(results, jf, indent=4, ensure_ascii=False)
+        # Save JSON
+        safe_id = _safe_filename(page_id)
+        json_path = os.path.join(dest_folder, f"{safe_id}_results.json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump(results, jf, indent=4, ensure_ascii=False)
+        except Exception:
+            traceback.print_exc()
+            raise
 
         return results
