@@ -1,0 +1,168 @@
+import os
+import json
+import re
+import pathlib
+import traceback
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+import requests
+
+# regex for file-like links
+FILE_EXTS = re.compile(
+    r"\.(pdf|docx|doc|xlsx|xls|pptx|ppt|odt|rtf|txt|zip|tar|gz|xlsm)$",
+    re.IGNORECASE,
+)
+
+def is_file_link(url: str) -> bool:
+    parsed = urlparse(url)
+    return bool(FILE_EXTS.search(parsed.path or ""))
+
+def _safe_filename(s: str, fallback: str = "page") -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(s))
+    return safe or fallback
+
+def crawl_nested_links(results, headers=None, verify=True, timeout=8.0):
+    """
+    Crawl inside jira & confluence links and categorize nested anchors.
+    """
+    results.setdefault("nested_links", {})
+    seeds = results["links"].get("jira", []) + results["links"].get("confluence", [])
+
+    session = requests.Session()
+    if headers:
+        session.headers.update(headers)
+
+    for parent_url in seeds:
+        nested = {"jira": [], "confluence": [], "external": [], "files": []}
+        try:
+            resp = session.get(parent_url, timeout=timeout, verify=verify)
+            resp.raise_for_status()
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            content_area = (
+                soup.find("div", {"id": "main-content"})
+                or soup.find("div", {"id": "content"})
+                or soup.find("div", {"id": "wiki-content"})
+                or soup.find("div", {"id": "descriptionmodule"})
+                or soup.find("div", {"id": "issue-content"})
+                or soup
+            )
+
+            for a in content_area.find_all("a", href=True):
+                child = urljoin(parent_url, a["href"]).split("#")[0]
+
+                if is_file_link(child):
+                    if child not in nested["files"]:
+                        nested["files"].append(child)
+                    if child not in results["links"]["files"]:
+                        results["links"]["files"].append(child)
+                elif "jira" in child.lower():
+                    if child not in nested["jira"]:
+                        nested["jira"].append(child)
+                elif "confluence" in child.lower():
+                    if child not in nested["confluence"]:
+                        nested["confluence"].append(child)
+                else:
+                    if child not in nested["external"]:
+                        nested["external"].append(child)
+
+            results["nested_links"][parent_url] = nested
+
+        except Exception as e:
+            print(f"[WARN] Failed to crawl {parent_url}: {e}")
+            results["nested_links"][parent_url] = {
+                "jira": [], "confluence": [], "external": [], "files": []
+            }
+
+    return results
+
+
+def extract_and_save_links(self, dest_folder: str, page_id: str, page_html: str,
+                           page_base: str = None,
+                           download_attachments: bool = False,
+                           attachment_items: list = None,
+                           requests_auth=None,
+                           requests_verify: bool = True):
+    """
+    Extract links from Confluence page HTML, categorize them, crawl nested links,
+    and save results JSON.
+    """
+
+    # Ensure dest folder exists
+    dest_folder = os.path.abspath(dest_folder)
+    pathlib.Path(dest_folder).mkdir(parents=True, exist_ok=True)
+
+    # Prepare results structure with all 4 categories
+    results = {
+        "links": {
+            "jira": [],
+            "confluence": [],
+            "external": [],
+            "files": []
+        }
+    }
+
+    # Base URL for resolving relative links
+    confluence_base = getattr(self, "CONFLUENCE_BASE", None) or page_base or ""
+
+    # Parse the page HTML
+    soup = BeautifulSoup(page_html or "", "html.parser")
+
+    for a in soup.find_all("a", href=True):
+        raw_href = a["href"].strip()
+        full_url = urljoin(confluence_base, raw_href) if confluence_base else raw_href
+        lowered = full_url.lower()
+
+        if is_file_link(full_url):
+            if full_url not in results["links"]["files"]:
+                results["links"]["files"].append(full_url)
+        elif "jira" in lowered or "/browse/" in lowered:
+            if full_url not in results["links"]["jira"]:
+                results["links"]["jira"].append(full_url)
+        elif (confluence_base and confluence_base in full_url) or full_url.startswith("/wiki") or full_url.startswith("/pages"):
+            if full_url not in results["links"]["confluence"]:
+                results["links"]["confluence"].append(full_url)
+        else:
+            if full_url not in results["links"]["external"]:
+                results["links"]["external"].append(full_url)
+
+    # Optionally download attachments (disabled by default)
+    if download_attachments and attachment_items:
+        for att in attachment_items:
+            download_url = att.get("download_url") or att.get("_links", {}).get("download")
+            filename = att.get("fileName") or att.get("title") or os.path.basename(urlparse(download_url).path or "")
+            if not download_url:
+                continue
+            local_path = os.path.join(dest_folder, filename)
+            if os.path.exists(local_path):
+                continue
+            try:
+                with requests.get(download_url, stream=True, auth=requests_auth, verify=requests_verify) as r:
+                    r.raise_for_status()
+                    with open(local_path, "wb") as fh:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                fh.write(chunk)
+            except Exception as e:
+                print(f"Failed to download attachment {download_url}: {e}")
+                traceback.print_exc()
+                continue
+
+    # --- Crawl nested jira & confluence links ---
+    try:
+        hdrs = None
+        if hasattr(self, "conf_provider"):
+            hdrs = self.conf_provider.get_headers()
+
+        crawl_nested_links(results, headers=hdrs, verify=getattr(self, "verify", True))
+    except Exception as e:
+        print("Nested crawl failed:", e)
+
+    # Save results JSON
+    safe_id = _safe_filename(page_id)
+    json_path = os.path.join(dest_folder, f"{safe_id}_results.json")
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(results, jf, indent=4, ensure_ascii=False)
+
+    print(f"Results saved to {json_path}")
+    return results
