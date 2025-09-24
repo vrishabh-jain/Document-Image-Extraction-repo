@@ -1,0 +1,152 @@
+# ---------- Add this block into your module (next to your existing functions) ----------
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import time
+
+# Reuse your file-detection regex / helper
+# If you already have FILE_LINK_EXT_RE or _is_file_link, use that. Otherwise include:
+import re
+FILE_LINK_EXT_RE = re.compile(
+    r"\.(pdf|docx|doc|xlsx|xls|pptx|ppt|odt|rtf|txt|zip|tar|gz|xlsm)$",
+    re.IGNORECASE,
+)
+def _is_file_link(href: str) -> bool:
+    if not href:
+        return False
+    parsed = urlparse(href)
+    path = parsed.path or ""
+    return bool(FILE_LINK_EXT_RE.search(path))
+
+def _same_origin(url1: str, url2: str) -> bool:
+    """Return True if two URLs share scheme+netloc."""
+    try:
+        p1, p2 = urlparse(url1), urlparse(url2)
+        return (p1.scheme, p1.netloc) == (p2.scheme, p2.netloc)
+    except Exception:
+        return False
+
+def crawl_extracted_links(
+    results: dict,
+    seeds: list,
+    *,
+    page_base: str = None,
+    max_depth: int = 1,
+    max_pages: int = 200,
+    timeout: float = 8.0,
+    same_site_only: bool = True,
+    requests_auth=None,
+    requests_verify: bool = True,
+    delay_between_requests: float = 0.2,
+):
+    """
+    Crawl the seed URLs (list of absolute or relative URLs) up to max_depth levels,
+    augment `results` in-place by adding results["nested_links"] mapping:
+        results["nested_links"][source_url] = [child_url, child_url, ...]
+    Also appends any discovered file-like anchor URLs into results["files"] (if not present).
+
+    Parameters:
+    - results: the dict you already produce (will be modified)
+    - seeds: list of start URLs to crawl (e.g., combine results["links"]["confluence"] + ...)
+    - page_base: base to resolve relative links, if needed
+    - max_depth: how many levels deep to crawl (1 = crawl only seeds' immediate anchors)
+    - max_pages: global hard limit on pages fetched
+    - same_site_only: if True only crawls links that share origin with the seed (prevents broad web crawl)
+    - timeout: per-request timeout
+    - requests_auth/requests_verify: passed to requests.get
+    - delay_between_requests: polite pause between requests
+    """
+
+    # Prepare results nested structure if not present
+    results.setdefault("nested_links", {})
+
+    visited = set()     # absolute URLs we've already fetched
+    to_visit = []       # items are tuples (url, depth, seed_origin)
+    pages_fetched = 0
+
+    # Seed normalization + queue
+    for s in seeds:
+        full = urljoin(page_base, s) if page_base and not urlparse(s).scheme else s
+        # enqueue seed's immediate children with depth=1 (so depth 1 means one hop)
+        to_visit.append((full, 1, full))  # keep seed origin for same-site checks
+
+    session = requests.Session()
+    # Optional: set a common User-Agent
+    session.headers.update({"User-Agent": "ConfluenceLinkCrawler/1.0 (+https://example)"})
+
+    while to_visit and pages_fetched < max_pages:
+        url, depth, seed_origin = to_visit.pop(0)
+        if url in visited:
+            continue
+        if depth > max_depth:
+            continue
+        # Optionally limit to same origin to avoid crawling the whole web
+        if same_site_only and not _same_origin(seed_origin, url):
+            # skip cross-origin pages
+            continue
+
+        try:
+            resp = session.get(url, timeout=timeout, auth=requests_auth, verify=requests_verify)
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+            # Quick filter: skip non-HTML responses
+            if "html" not in content_type.lower():
+                visited.add(url)
+                continue
+
+            html = resp.text
+            pages_fetched += 1
+            visited.add(url)
+
+            soup = BeautifulSoup(html, "html.parser")
+            found = []
+
+            for a in soup.find_all("a", href=True):
+                raw = a["href"].strip()
+                child = urljoin(url, raw)  # resolve relative against the current page
+                # normalize (drop fragment)
+                parsed = urlparse(child)
+                child = parsed._replace(fragment="").geturl()
+
+                # if it's a file link, append to results["files"] and don't enqueue for crawl
+                if _is_file_link(child):
+                    if child not in results.get("files", []):
+                        results.setdefault("files", []).append(child)
+                    found.append(child)
+                    continue
+
+                # optionally enforce same-site for the child before enqueueing
+                if same_site_only and not _same_origin(seed_origin, child):
+                    # add to results but don't enqueue
+                    if child not in results["links"].get("external", []) and child not in results["links"].get("confluence", []):
+                        # add to external if not present
+                        results["links"].setdefault("external", []).append(child)
+                    found.append(child)
+                    continue
+
+                # record discovered child and enqueue if not visited
+                if child not in found:
+                    found.append(child)
+                if child not in visited:
+                    # next depth = depth + 1
+                    to_visit.append((child, depth + 1, seed_origin))
+
+            # save children for this source url
+            results["nested_links"].setdefault(url, [])
+            # extend while keeping uniqueness
+            for f in found:
+                if f not in results["nested_links"][url]:
+                    results["nested_links"][url].append(f)
+
+        except requests.RequestException:
+            # network error - skip this url but continue crawling others
+            # optionally log: print(f"Failed to fetch {url}: {e}")
+            visited.add(url)
+        except Exception:
+            # unexpected parsing error - don't stop crawl
+            visited.add(url)
+        finally:
+            time.sleep(delay_between_requests)
+
+    return results
+# ---------- End block ----------
