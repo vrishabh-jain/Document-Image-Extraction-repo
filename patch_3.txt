@@ -1,18 +1,14 @@
-import os
-from urllib.parse import urljoin, urlparse
-
 def download_attachments_from_page(self, dest_folder: str, skip_filenames: set = None):
     """
     Finds attachment links in page HTML and downloads each, unless the predicted filename
-    (basename) is present in skip_filenames. Returns mapping url -> local_path (or None).
+    is present in skip_filenames. Returns mapping url -> local_path (or None).
     """
     if skip_filenames is None:
         skip_filenames = set()
     else:
-        # make sure basenames only and normalized
         skip_filenames = {os.path.basename(s).strip() for s in skip_filenames if s}
 
-    page_soup = self.confluence_content.get_page_as_html()
+    page_soup = self.confluence_content.get_page_as_html()   # <-- corrected
     if not page_soup:
         print("No page HTML available to search for attachments.")
         return {}
@@ -24,7 +20,6 @@ def download_attachments_from_page(self, dest_folder: str, skip_filenames: set =
         return {}
 
     links = self._find_attachment_links_in_soup(soup)
-    # fallback to export view if none found (your existing logic)
     if not links:
         export_soup = self.confluence_content.get_page_export_view_as_html()
         if export_soup:
@@ -36,27 +31,15 @@ def download_attachments_from_page(self, dest_folder: str, skip_filenames: set =
 
     downloaded_map = {}
     for link in links:
-        # Predict filename for the link before downloading (same logic as _safe_filename_from_url)
-        # If the server returns content-disposition, the real filename may differ; but this is a good heuristic.
-        predicted_name = None
-        # If the link looks like a Confluence download attachment, sometimes the filename is last path component
-        parsed = urlparse(link)
-        predicted_name = os.path.basename(parsed.path).split('?')[0]
-
+        predicted_name = os.path.basename(urlparse(link).path).split('?')[0]
         if not predicted_name:
-            # fallback to your safe generator
             predicted_name = self._safe_filename_from_url(link)
 
-        # Normalize predicted name and check skip set
-        predicted_name_norm = predicted_name.strip()
-        if predicted_name_norm in skip_filenames:
-            print(f"Skipping {link} because predicted filename '{predicted_name_norm}' already downloaded.")
-            # record mapping to None or to the local file if you can find it in skip_filenames as full path
-            # best effort: try to find local path in previous API results (if provided as full paths)
+        if predicted_name in skip_filenames:
+            print(f"Skipping {link} (already downloaded: {predicted_name})")
             downloaded_map[link] = None
             continue
 
-        # otherwise, attempt to download
         local = self.download_attachment(link, dest_folder)
         downloaded_map[link] = local
         if local:
@@ -69,38 +52,23 @@ def download_attachments_from_page(self, dest_folder: str, skip_filenames: set =
 
 def download_api_then_page(self, page_id: str, dest_folder: str):
     """
-    1) Call attachments API to download attachments and collect filenames saved.
-    2) Call page-based download, skipping any predicted filenames found in step 1.
-    Returns a combined dict of downloads.
+    1) Download via attachments API first.
+    2) Then download attachments discovered in page HTML,
+       skipping any whose filename was already downloaded.
     """
     combined = {}
 
-    # Step 1: download via attachments API (authoritative)
-    print("Step 1: Downloading attachments via API...")
-    api_map = self.download_attachments_via_api(page_id, dest_folder)  # att_id -> local_path
-    # normalize and collect basenames of files downloaded via API
+    # Step 1: API
+    api_map = self.download_attachments_via_api(page_id, dest_folder)
     downloaded_filenames = set()
     for att_id, local_path in (api_map or {}).items():
         combined[f"confluence://{page_id}/attachment/{att_id}"] = local_path
         if local_path:
             downloaded_filenames.add(os.path.basename(local_path))
 
-    # Step 2: download attachments discovered in page HTML but skip duplicates
-    print("Step 2: Scanning page HTML for linked attachments (skipping already-downloaded files)...")
+    # Step 2: Page HTML
     page_map = self.download_attachments_from_page(dest_folder, skip_filenames=downloaded_filenames)
-    # page_map: link_url -> local_path
-    # Merge page_map into combined; if page_map value is None (skipped), try to map to API local file by name
     for link, local in (page_map or {}).items():
-        if local:
-            combined[link] = local
-        else:
-            # local is None meaning we skipped or failed: attempt to match by basename
-            predicted = os.path.basename(urlparse(link).path).split('?')[0]
-            matched_local = None
-            for attkey, lpath in combined.items():
-                if lpath and os.path.basename(lpath) == predicted:
-                    matched_local = lpath
-                    break
-            combined[link] = matched_local
+        combined[link] = local
 
     return combined
