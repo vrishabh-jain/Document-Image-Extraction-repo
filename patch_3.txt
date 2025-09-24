@@ -1,0 +1,64 @@
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import re
+
+# file extensions
+FILE_EXTS = re.compile(r"\.(pdf|docx|doc|xlsx|xls|pptx|ppt|odt|rtf|txt|zip|tar|gz|xlsm)$", re.IGNORECASE)
+
+def is_file_link(url: str) -> bool:
+    parsed = urlparse(url)
+    return bool(FILE_EXTS.search(parsed.path or ""))
+
+def crawl_nested_links(results, headers=None, verify=True, timeout=8.0):
+    """
+    Crawl inside jira & confluence links already in results["links"].
+    Adds results["nested_links"][parent] = [child, child...]
+    """
+
+    results.setdefault("nested_links", {})
+
+    # collect only jira + confluence as seeds
+    seeds = results["links"].get("jira", []) + results["links"].get("confluence", [])
+
+    session = requests.Session()
+    if headers:
+        session.headers.update(headers)
+
+    for parent_url in seeds:
+        children = []
+        try:
+            resp = session.get(parent_url, timeout=timeout, verify=verify)
+            resp.raise_for_status()
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # ---- Scope to content containers ----
+            content_area = (
+                soup.find("div", {"id": "main-content"})
+                or soup.find("div", {"id": "content"})
+                or soup.find("div", {"id": "wiki-content"})
+                or soup.find("div", {"id": "descriptionmodule"})
+                or soup.find("div", {"id": "issue-content"})
+                or soup  # fallback: whole page
+            )
+
+            for a in content_area.find_all("a", href=True):
+                child = urljoin(parent_url, a["href"]).split("#")[0]
+
+                # keep only jira/confluence/file links
+                if "jira" in child.lower() or "confluence" in child.lower() or is_file_link(child):
+                    if child not in children:
+                        children.append(child)
+
+                        # if it's a file-like link, also store in results["files"]
+                        if is_file_link(child) and child not in results["files"]:
+                            results["files"].append(child)
+
+            results["nested_links"][parent_url] = children
+
+        except Exception as e:
+            print(f"[WARN] Failed to crawl {parent_url}: {e}")
+            results["nested_links"][parent_url] = []
+
+    return results
