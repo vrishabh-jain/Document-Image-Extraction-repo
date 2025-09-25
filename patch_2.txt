@@ -1,0 +1,40 @@
+import re
+import json
+from collections import OrderedDict
+
+URL_RE = re.compile(r"https?://[^\s\"\'\)\]\}\<\>]+")
+
+def _extract_urls_from_obj(obj, found):
+    """
+    Recursively traverse obj (dict/list/str/other) and add any URLs found in strings to 'found' list.
+    'found' should be a list (keeps order) — dedup handled by caller.
+    """
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _extract_urls_from_obj(v, found)
+    elif isinstance(obj, list) or isinstance(obj, tuple) or isinstance(obj, set):
+        for item in obj:
+            _extract_urls_from_obj(item, found)
+    elif isinstance(obj, str):
+        for m in URL_RE.findall(obj):
+            found.append(m)
+    # ignore other types (int/float/None/bool), nothing to do
+
+def save_urls_from_response(response_obj, out_filename="urls.json"):
+    """
+    Extracts http/https URLs from response_obj (likely the parsed JSON from response.json())
+    and writes a deduplicated list (preserving first occurrence order) to out_filename.
+    Returns the list of extracted URLs.
+    """
+    raw_found = []
+    _extract_urls_from_obj(response_obj, raw_found)
+
+    # Deduplicate while preserving order
+    deduped = list(OrderedDict.fromkeys(raw_found))
+
+    # Save to file
+    with open(out_filename, "w", encoding="utf-8") as f:
+        json.dump(deduped, f, indent=2, ensure_ascii=False)
+
+    print(f"Saved {len(deduped)} URLs to {out_filename}")
+    return deduped
