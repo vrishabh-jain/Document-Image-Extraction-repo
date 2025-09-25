@@ -1,130 +1,137 @@
-#!/usr/bin/env python3
-"""
-jira_extract_links_json.py
-
-Usage:
-  1) pip install requests
-  2) Put one JIRA URL or issue key per line in issue_list.txt
-  3) Edit JIRA_BASE, EMAIL, API_TOKEN
-  4) python jira_extract_links_json.py
-"""
-
-import re
 import requests
-import os
+import re
 import json
-from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 
-# ---------- CONFIG ----------
-JIRA_BASE = "https://yourcompany.atlassian.net"   # e.g. https://myorg.atlassian.net
-EMAIL = "your.email@company.com"
-API_TOKEN = "YOUR_API_TOKEN"
-ISSUE_LIST_FILE = "issue_list.txt"   # one JIRA URL or key per line
-OUTPUT_JSON = "found_links.json"
-# ----------------------------
 
-URL_RE = re.compile(r"https?://[^\s\)\]\}>\'\"`]+", re.IGNORECASE)
+class Jira:
+    def __init__(self):
+        # ⚠️ Your token and URLs from the snapshot
+        self.token = "ODE3ND...<redacted>...FSfEH7c"
+        self.url_pre = "https://wpb-aap-utility.../jira/jql?useCache=false"
+        self.url = "https://wpb-aap-utility.../jira/jql?useCache=false"
 
-def issue_key_from_line(line: str) -> str:
-    line = line.strip()
-    if not line:
-        return ""
-    if "browse" in line:
-        return line.split("/")[-1]
-    return line
+    def get_ori(self, jira_key):
+        """Fetch issue details by key."""
+        payload = {
+            "apiPrefix": "https://wpb-jira.systems.uk.hsbc",
+            "apiVersion": "2",
+            "token": self.token,
+            "jql": {
+                "startAt": 0,
+                "maxResults": 1,
+                "jql": f'key="{jira_key}"'
+            }
+        }
+        response = requests.post(self.url, json=payload, verify=False)
+        return response.json()
 
-def get_issue(issue_key: str, session: requests.Session):
-    url = f"{JIRA_BASE}/rest/api/2/issue/{issue_key}?expand=renderedFields,changelog"
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    def get_jql(self, jql_lang):
+        """Fetch issue details by custom JQL."""
+        payload = {
+            "apiPrefix": "https://wpb-jira.systems.uk.hsbc",
+            "apiVersion": "2",
+            "token": self.token,
+            "jql": {
+                "startAt": 0,
+                "maxResults": 100,
+                "jql": jql_lang
+            }
+        }
+        response = requests.post(self.url, json=payload, verify=False)
+        return response.json()
 
-def get_comments(issue_key: str, session: requests.Session):
-    comments = []
-    start = 0
-    maxResults = 50
-    while True:
-        url = f"{JIRA_BASE}/rest/api/2/issue/{issue_key}/comment?startAt={start}&maxResults={maxResults}"
-        r = session.get(url, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        comments.extend(data.get("comments", []))
-        if start + maxResults >= data.get("total", 0):
-            break
-        start += maxResults
-    return comments
 
-def extract_links(text: str):
-    if not text:
-        return []
-    found = URL_RE.findall(str(text))
-    cleaned = [u.rstrip(".,;:)\"'>]}") for u in found]
-    return list(dict.fromkeys(cleaned))  # dedupe
+# -------- URL Extraction Helpers -------- #
 
-def main():
-    if not os.path.exists(ISSUE_LIST_FILE):
-        print(f"Input file '{ISSUE_LIST_FILE}' not found.")
-        return
+URL_RE = re.compile(r'https?://[^\s"\'<>]+')
 
-    session = requests.Session()
-    session.auth = (EMAIL, API_TOKEN)
-    session.headers.update({"Accept": "application/json"})
+def extract_urls_from_html(html):
+    """Extracts URLs from HTML using BeautifulSoup and regex fallback."""
+    urls = set()
+    if not html:
+        return urls
 
-    with open(ISSUE_LIST_FILE, "r", encoding="utf-8") as f:
-        issue_keys = [issue_key_from_line(l) for l in f if l.strip()]
+    soup = BeautifulSoup(html, "html.parser")
 
-    print(f"Processing {len(issue_keys)} issues...")
+    # <a href="...">
+    for a in soup.find_all("a", href=True):
+        urls.add(a["href"].strip())
 
-    results = {}
+    # Plain text URLs
+    text = soup.get_text(separator=" ")
+    urls.update(URL_RE.findall(text))
 
-    for ik in issue_keys:
-        print(f"Fetching {ik} ...")
-        try:
-            data = get_issue(ik, session)
-        except Exception as e:
-            print(f"  ERROR: {e}")
+    return urls
+
+
+def collect_urls_from_issue(issue_json):
+    """
+    Extracts URLs from JIRA issue JSON:
+    - description
+    - comments
+    - attachments
+    """
+    urls = set()
+    fields = issue_json.get("fields", {})
+
+    # Description (may be plain text or HTML)
+    desc = fields.get("description", "")
+    urls.update(extract_urls_from_html(desc))
+
+    # Comments
+    comments = fields.get("comment", {}).get("comments", [])
+    for c in comments:
+        body = c.get("body", "")
+        urls.update(extract_urls_from_html(body))
+
+    # Attachments
+    attachments = fields.get("attachment", [])
+    for att in attachments:
+        content_url = att.get("content")
+        if content_url:
+            urls.add(content_url)
+
+    return list(urls)
+
+
+# -------- Main Flow -------- #
+
+def save_urls_to_json(jira, jira_urls, filename="jira_urls.json"):
+    """
+    Takes a list of browse URLs (e.g., https://.../browse/ABC-123),
+    fetches issue data, extracts embedded URLs, and saves to JSON.
+    """
+    data = {}
+    for url in jira_urls:
+        issue_key = url.rstrip("/").split("/")[-1]  # Extract ABC-123
+        print(f"Processing {issue_key} ...")
+
+        issue_json = jira.get_ori(issue_key)
+        issues = issue_json.get("issues", [])
+        if not issues:
+            print(f"No data found for {issue_key}")
             continue
 
-        fields = data.get("fields", {})
-        issue_result = {"description": [], "comments": [], "other_fields": [], "attachments": []}
+        # First issue from response
+        issue = issues[0]
+        urls = collect_urls_from_issue(issue)
+        data[issue_key] = urls
 
-        # description
-        issue_result["description"] = extract_links(fields.get("description", ""))
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-        # other fields (environment, customfields, etc.)
-        for fname, fval in fields.items():
-            if fname in ("description", "comment", "attachment"):
-                continue
-            links = extract_links(str(fval))
-            if links:
-                issue_result["other_fields"].extend(links)
+    print(f"✅ Extracted URLs saved to {filename}")
 
-        # attachments
-        for att in fields.get("attachment", []) or []:
-            if att.get("content"):
-                issue_result["attachments"].append(att["content"])
 
-        # comments
-        try:
-            comments = get_comments(ik, session)
-            for c in comments:
-                links = extract_links(c.get("body", ""))
-                if links:
-                    issue_result["comments"].extend(links)
-        except Exception as e:
-            print(f"  WARNING fetching comments: {e}")
-
-        # dedupe inside each section
-        for k in issue_result:
-            issue_result[k] = list(dict.fromkeys(issue_result[k]))
-
-        results[ik] = issue_result
-
-    # save JSON
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-
-    print(f"Done. Saved results to {OUTPUT_JSON}")
+# -------- Example Usage -------- #
 
 if __name__ == "__main__":
-    main()
+    jira = Jira()
+
+    jira_urls = [
+        "https://wpb-jira.systems.uk.hsbc/browse/ABC-123456",
+        "https://wpb-jira.systems.uk.hsbc/browse/XYZ-654321",
+    ]
+
+    save_urls_to_json(jira, jira_urls)
