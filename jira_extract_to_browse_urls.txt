@@ -1,0 +1,275 @@
+"""
+Simple end-to-end extractor that uses your existing Jira class (internal.py)
+and writes a JSON mapping: { browse_url: [list of filtered URLs] }.
+
+Usage:
+    1. put this file next to your internal.py (which defines Jira)
+    2. pip install requests beautifulsoup4
+    3. Edit `browse_urls` list below or run with CLI args:
+       python jira_extract_to_browse_urls.py https://.../browse/ABC-1 https://.../browse/DEF-2
+    4. Output file: jira_issue_urls.json
+"""
+
+import sys
+import re
+import json
+from pathlib import Path
+from typing import Any, Set
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
+
+# import your Jira class (must be named Jira in internal.py)
+from internal import Jira
+
+# -------------------- Config --------------------
+# default list (edit or pass via CLI)
+browse_urls = [
+    # example; replace with your URLs or pass via CLI
+    "https://wpb-jira.systems.uk.hsbc/browse/WPB-408337",
+]
+
+OUTPUT_FILE = "jira_issue_urls.json"
+
+# -------------------- Regex helpers --------------------
+URL_REGEX = re.compile(r'https?://[^\s)>\]\["\']+')
+MD_LINK_REGEX = re.compile(r'\[.*?\]\((https?://[^\s)]+)\)')
+ANGLE_LINK_REGEX = re.compile(r'<(https?://[^>]+)>')
+ISSUE_KEY_RE = re.compile(r'[A-Z][A-Z0-9]+-\d+', re.I)
+
+# -------------------- Extraction primitives --------------------
+def ensure_abs(href: str, host_base: str) -> str:
+    if not href:
+        return href
+    parsed = urlparse(href)
+    if parsed.scheme:
+        return href
+    return urljoin(host_base, href)
+
+def extract_urls_from_html(html: str) -> Set[str]:
+    found = set()
+    if not html:
+        return found
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        soup = None
+
+    if soup:
+        # anchor hrefs
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href:
+                found.add(href)
+        # src/data-src/content attributes
+        for tag in soup.find_all(True):
+            for attr in ("src", "data-src", "data-href", "content"):
+                if tag.has_attr(attr):
+                    val = tag.get(attr)
+                    if isinstance(val, str) and val.startswith("http"):
+                        found.add(val.strip())
+
+    # regex fallback (catches inline markdown / raw text)
+    for u in URL_REGEX.findall(html):
+        found.add(u.strip())
+    for u in MD_LINK_REGEX.findall(html):
+        found.add(u.strip())
+    for u in ANGLE_LINK_REGEX.findall(html):
+        found.add(u.strip())
+
+    return found
+
+def extract_urls_from_text(text: str) -> Set[str]:
+    found = set()
+    if not text:
+        return found
+    for u in URL_REGEX.findall(text):
+        found.add(u.strip())
+    for u in MD_LINK_REGEX.findall(text):
+        found.add(u.strip())
+    for u in ANGLE_LINK_REGEX.findall(text):
+        found.add(u.strip())
+    return found
+
+def scan_attachment_for_urls(att: dict) -> Set[str]:
+    urls = set()
+    if not isinstance(att, dict):
+        return urls
+    # common attachment fields that carry URLs
+    for k in ("content", "self", "thumbnail", "url", "download"):
+        v = att.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            urls.add(v.strip())
+    # scan nested strings too
+    for v in att.values():
+        if isinstance(v, str):
+            urls.update(extract_urls_from_text(v))
+        elif isinstance(v, (dict, list)):
+            urls.update(recursive_scan_for_urls(v))
+    return urls
+
+def recursive_scan_for_urls(obj: Any) -> Set[str]:
+    found = set()
+    if obj is None:
+        return found
+    if isinstance(obj, str):
+        found.update(extract_urls_from_html(obj))
+        found.update(extract_urls_from_text(obj))
+        return found
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in ("attachment", "attachments") and isinstance(v, list):
+                for att in v:
+                    found.update(scan_attachment_for_urls(att))
+            else:
+                found.update(recursive_scan_for_urls(v))
+        return found
+    if isinstance(obj, list):
+        for itm in obj:
+            found.update(recursive_scan_for_urls(itm))
+        return found
+    return found
+
+# -------------------- Filter / normalize --------------------
+def filter_out_internal_jira_urls(urls: Set[str], jira_host: str) -> Set[str]:
+    """
+    Removes JIRA REST API endpoints (containing '/rest/api') and
+    internal self-links, but keeps:
+      - /browse/{KEY} links (if present)
+      - attachments (we allow those)
+      - external domains
+    """
+    clean = set()
+    rest_indicator = f"{jira_host}/rest/api"
+    for u in urls:
+        if not isinstance(u, str) or not u.strip():
+            continue
+        u = u.strip()
+        # normalize relative to jira_host if needed
+        if u.startswith("/"):
+            u = urljoin(jira_host, u)
+
+        # skip raw internal REST API endpoints (noise)
+        if rest_indicator in u:
+            # keep attachments that include '/attachment/' or '/secure/attachment/'
+            if "/attachment/" in u or "/secure/attachment/" in u:
+                clean.add(u)
+            else:
+                # drop other rest/api urls
+                continue
+
+        else:
+            # keep browse links and external links
+            clean.add(u)
+    return clean
+
+# -------------------- Orchestration --------------------
+def extract_issue_key_from_browse_url(browse_url: str) -> str:
+    return browse_url.rstrip("/").split("/")[-1]
+
+def host_base_from_browse_url(browse_url: str) -> str:
+    p = urlparse(browse_url)
+    return f"{p.scheme}://{p.netloc}"
+
+def process_single(jira: Jira, browse_url: str):
+    """Returns list of filtered URLs for the given browse_url."""
+    key = extract_issue_key_from_browse_url(browse_url)
+    print(f"Processing {key} ...")
+    raw = jira.get_ori(key)
+
+    # handle response forms (text or dict)
+    if isinstance(raw, str):
+        try:
+            resp = json.loads(raw)
+        except Exception:
+            # not JSON: save raw and return empty list
+            Path(f"{key}_raw_response.txt").write_text(raw, encoding="utf-8")
+            print(f"Warning: non-JSON response for {key}, saved to {key}_raw_response.txt")
+            return []
+        else:
+            resp_obj = resp
+    elif isinstance(raw, dict):
+        resp_obj = raw
+    else:
+        print(f"Unexpected response type for {key}: {type(raw)}")
+        return []
+
+    # if wrapper contains issues[], take the first issue
+    if isinstance(resp_obj, dict) and resp_obj.get("issues"):
+        issue = resp_obj["issues"][0]
+    else:
+        issue = resp_obj
+
+    all_urls = set()
+    host_base = host_base_from_browse_url(browse_url)
+
+    # 1) prefer renderedFields (HTML) when present
+    rendered = issue.get("renderedFields") or {}
+    if rendered:
+        all_urls.update(extract_urls_from_html(rendered.get("description", "")))
+        # rendered comments
+        comm_block = rendered.get("comment") or {}
+        if isinstance(comm_block, dict):
+            for c in comm_block.get("comments", []):
+                body = c.get("body") or c.get("renderedBody") or ""
+                all_urls.update(extract_urls_from_html(body))
+
+    # 2) raw fields
+    fields = issue.get("fields") or {}
+    all_urls.update(extract_urls_from_html(fields.get("description", "")))
+    # raw comments
+    comments = fields.get("comment", {}).get("comments", []) if isinstance(fields.get("comment", {}), dict) else []
+    for c in comments:
+        body = c.get("body", "")
+        all_urls.update(extract_urls_from_html(body))
+        all_urls.update(extract_urls_from_text(body))
+
+    # attachments explicitly
+    for att in fields.get("attachment", []) if isinstance(fields.get("attachment", []), list) else []:
+        all_urls.update(scan_attachment_for_urls(att))
+
+    # fallback: full recursive scan
+    all_urls.update(recursive_scan_for_urls(issue))
+
+    # Normalize absolute URLs relative to host_base where necessary
+    normalized = set()
+    for u in all_urls:
+        if not isinstance(u, str) or not u.strip():
+            continue
+        # make absolute if relative
+        if u.startswith("/"):
+            u = urljoin(host_base, u)
+        normalized.add(u.strip())
+
+    # Filter out internal REST API noise
+    jira_host = urlparse(browse_url).netloc
+    filtered = filter_out_internal_jira_urls(normalized, f"{urlparse(browse_url).scheme}://{jira_host}")
+
+    # Final: remove duplicates, sort
+    final_list = sorted(filtered)
+    return final_list
+
+def main():
+    # CLI override: pass browse URLs as args
+    args = sys.argv[1:]
+    if args:
+        urls_to_process = args
+    else:
+        urls_to_process = browse_urls
+
+    jira = Jira()
+    out = {}
+
+    for b in urls_to_process:
+        try:
+            urls = process_single(jira, b)
+        except Exception as e:
+            print(f"Error processing {b}: {e}")
+            urls = []
+        out[b] = urls
+        print(f" -> {len(urls)} urls found for {b}")
+
+    Path(OUTPUT_FILE).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\nDone. Results saved to {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
