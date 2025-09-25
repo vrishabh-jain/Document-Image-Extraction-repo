@@ -1,40 +1,55 @@
-import re
-import json
-from collections import OrderedDict
+if __name__ == "__main__":
+    import json
+    from json import JSONDecodeError
 
-URL_RE = re.compile(r"https?://[^\s\"\'\)\]\}\<\>]+")
+    issue_key = "WDP-391787"   # change to whatever you want to fetch
 
-def _extract_urls_from_obj(obj, found):
-    """
-    Recursively traverse obj (dict/list/str/other) and add any URLs found in strings to 'found' list.
-    'found' should be a list (keeps order) — dedup handled by caller.
-    """
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _extract_urls_from_obj(v, found)
-    elif isinstance(obj, list) or isinstance(obj, tuple) or isinstance(obj, set):
-        for item in obj:
-            _extract_urls_from_obj(item, found)
-    elif isinstance(obj, str):
-        for m in URL_RE.findall(obj):
-            found.append(m)
-    # ignore other types (int/float/None/bool), nothing to do
+    # ---- call your existing fetch function (adjust if your function name is different) ----
+    # Expecting `response` to be a requests.Response or an object with `.text` and `.json()` available.
+    response = jira.get_issue(issue_key)   # <-- adjust this line to your actual call
+    # --------------------------------------------------------------------------------------
 
-def save_urls_from_response(response_obj, out_filename="urls.json"):
-    """
-    Extracts http/https URLs from response_obj (likely the parsed JSON from response.json())
-    and writes a deduplicated list (preserving first occurrence order) to out_filename.
-    Returns the list of extracted URLs.
-    """
-    raw_found = []
-    _extract_urls_from_obj(response_obj, raw_found)
+    # Try to obtain a requests-like Response object (if jira.get_issue already returned text, adapt)
+    response_obj = None
+    response_json = None
 
-    # Deduplicate while preserving order
-    deduped = list(OrderedDict.fromkeys(raw_found))
+    # If `response` is a requests.Response object, use it directly:
+    try:
+        # Many codebases return requests.Response; if so use response.json()
+        response_json = response.json()
+        print("Parsed JSON via response.json()")
+    except Exception:
+        # Fallback: if `response` is a raw string with JSON
+        try:
+            if isinstance(response, str):
+                response_json = json.loads(response)
+                print("Parsed JSON from string response")
+            elif hasattr(response, "text"):
+                response_json = json.loads(response.text)
+                print("Parsed JSON from response.text")
+            else:
+                print("Could not parse response into JSON; response type:", type(response))
+        except JSONDecodeError:
+            print("Response is not valid JSON. Saving raw text instead.")
+            # Save raw text so you can inspect it
+            raw_fname = f"{issue_key}_raw.txt"
+            raw_text = response if isinstance(response, str) else getattr(response, "text", "<no-text>")
+            with open(raw_fname, "w", encoding="utf-8") as f:
+                f.write(raw_text)
+            print(f"Saved raw response to {raw_fname}")
 
-    # Save to file
-    with open(out_filename, "w", encoding="utf-8") as f:
-        json.dump(deduped, f, indent=2, ensure_ascii=False)
+    # If we have JSON, optionally save full JSON and extract URLs
+    if response_json is not None:
+        full_json_fname = f"{issue_key}.json"
+        with open(full_json_fname, "w", encoding="utf-8") as f:
+            json.dump(response_json, f, indent=2, ensure_ascii=False)
+        print(f"Saved JSON response to {full_json_fname}")
 
-    print(f"Saved {len(deduped)} URLs to {out_filename}")
-    return deduped
+        # Call the URL extractor you added earlier
+        try:
+            urls = save_urls_from_response(response_json, "urls.json")
+            print("Extracted URLs:", urls)
+        except Exception as e:
+            print("Error while extracting URLs:", repr(e))
+    else:
+        print("No JSON available — urls.json not created.")
