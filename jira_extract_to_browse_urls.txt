@@ -1,42 +1,32 @@
+# jira_extract_to_browse_urls_cli.py
 """
-Simple end-to-end extractor that uses your existing Jira class (internal.py)
-and writes a JSON mapping: { browse_url: [list of filtered URLs] }.
-
 Usage:
-    1. put this file next to your internal.py (which defines Jira)
-    2. pip install requests beautifulsoup4
-    3. Edit `browse_urls` list below or run with CLI args:
-       python jira_extract_to_browse_urls.py https://.../browse/ABC-1 https://.../browse/DEF-2
-    4. Output file: jira_issue_urls.json
+  - Place next to internal.py (which must define class Jira with method get_ori(key))
+  - pip install beautifulsoup4
+  - Run:
+      python jira_extract_to_browse_urls_cli.py https://.../browse/ABC-1 https://.../browse/DEF-2
+    or
+      python jira_extract_to_browse_urls_cli.py --file my_urls.txt
+Output:
+  - jira_issue_urls.json  (mapping: browse_url -> [urls...])
+  - debug files for non-JSON responses: {KEY}_raw_response.txt
 """
 
 import sys
+import argparse
 import re
 import json
 from pathlib import Path
 from typing import Any, Set
-from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
 
-# import your Jira class (must be named Jira in internal.py)
-from internal import Jira
+from internal import Jira  # your Jira class
 
-# -------------------- Config --------------------
-# default list (edit or pass via CLI)
-browse_urls = [
-    # example; replace with your URLs or pass via CLI
-    "https://wpb-jira.systems.uk.hsbc/browse/WPB-408337",
-]
-
-OUTPUT_FILE = "jira_issue_urls.json"
-
-# -------------------- Regex helpers --------------------
 URL_REGEX = re.compile(r'https?://[^\s)>\]\["\']+')
 MD_LINK_REGEX = re.compile(r'\[.*?\]\((https?://[^\s)]+)\)')
 ANGLE_LINK_REGEX = re.compile(r'<(https?://[^>]+)>')
-ISSUE_KEY_RE = re.compile(r'[A-Z][A-Z0-9]+-\d+', re.I)
 
-# -------------------- Extraction primitives --------------------
 def ensure_abs(href: str, host_base: str) -> str:
     if not href:
         return href
@@ -55,12 +45,10 @@ def extract_urls_from_html(html: str) -> Set[str]:
         soup = None
 
     if soup:
-        # anchor hrefs
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if href:
                 found.add(href)
-        # src/data-src/content attributes
         for tag in soup.find_all(True):
             for attr in ("src", "data-src", "data-href", "content"):
                 if tag.has_attr(attr):
@@ -68,14 +56,13 @@ def extract_urls_from_html(html: str) -> Set[str]:
                     if isinstance(val, str) and val.startswith("http"):
                         found.add(val.strip())
 
-    # regex fallback (catches inline markdown / raw text)
+    # regex fallback
     for u in URL_REGEX.findall(html):
         found.add(u.strip())
     for u in MD_LINK_REGEX.findall(html):
         found.add(u.strip())
     for u in ANGLE_LINK_REGEX.findall(html):
         found.add(u.strip())
-
     return found
 
 def extract_urls_from_text(text: str) -> Set[str]:
@@ -94,12 +81,10 @@ def scan_attachment_for_urls(att: dict) -> Set[str]:
     urls = set()
     if not isinstance(att, dict):
         return urls
-    # common attachment fields that carry URLs
     for k in ("content", "self", "thumbnail", "url", "download"):
         v = att.get(k)
         if isinstance(v, str) and v.startswith("http"):
             urls.add(v.strip())
-    # scan nested strings too
     for v in att.values():
         if isinstance(v, str):
             urls.update(extract_urls_from_text(v))
@@ -129,40 +114,26 @@ def recursive_scan_for_urls(obj: Any) -> Set[str]:
         return found
     return found
 
-# -------------------- Filter / normalize --------------------
-def filter_out_internal_jira_urls(urls: Set[str], jira_host: str) -> Set[str]:
-    """
-    Removes JIRA REST API endpoints (containing '/rest/api') and
-    internal self-links, but keeps:
-      - /browse/{KEY} links (if present)
-      - attachments (we allow those)
-      - external domains
-    """
+def filter_out_internal_jira_urls(urls: Set[str], host_base: str) -> Set[str]:
     clean = set()
-    rest_indicator = f"{jira_host}/rest/api"
+    rest_indicator = f"{host_base}/rest/api"
     for u in urls:
         if not isinstance(u, str) or not u.strip():
             continue
         u = u.strip()
-        # normalize relative to jira_host if needed
+        # make absolute if relative
         if u.startswith("/"):
-            u = urljoin(jira_host, u)
-
-        # skip raw internal REST API endpoints (noise)
+            u = urljoin(host_base, u)
+        # Skip generic JIRA REST noise unless it's an attachment
         if rest_indicator in u:
-            # keep attachments that include '/attachment/' or '/secure/attachment/'
             if "/attachment/" in u or "/secure/attachment/" in u:
                 clean.add(u)
             else:
-                # drop other rest/api urls
                 continue
-
         else:
-            # keep browse links and external links
             clean.add(u)
     return clean
 
-# -------------------- Orchestration --------------------
 def extract_issue_key_from_browse_url(browse_url: str) -> str:
     return browse_url.rstrip("/").split("/")[-1]
 
@@ -171,19 +142,17 @@ def host_base_from_browse_url(browse_url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 def process_single(jira: Jira, browse_url: str):
-    """Returns list of filtered URLs for the given browse_url."""
     key = extract_issue_key_from_browse_url(browse_url)
     print(f"Processing {key} ...")
     raw = jira.get_ori(key)
 
-    # handle response forms (text or dict)
+    # handle text or dict responses
     if isinstance(raw, str):
         try:
             resp = json.loads(raw)
         except Exception:
-            # not JSON: save raw and return empty list
             Path(f"{key}_raw_response.txt").write_text(raw, encoding="utf-8")
-            print(f"Warning: non-JSON response for {key}, saved to {key}_raw_response.txt")
+            print(f"Non-JSON response saved to {key}_raw_response.txt")
             return []
         else:
             resp_obj = resp
@@ -193,7 +162,7 @@ def process_single(jira: Jira, browse_url: str):
         print(f"Unexpected response type for {key}: {type(raw)}")
         return []
 
-    # if wrapper contains issues[], take the first issue
+    # if wrapper contains issues[]
     if isinstance(resp_obj, dict) and resp_obj.get("issues"):
         issue = resp_obj["issues"][0]
     else:
@@ -202,74 +171,79 @@ def process_single(jira: Jira, browse_url: str):
     all_urls = set()
     host_base = host_base_from_browse_url(browse_url)
 
-    # 1) prefer renderedFields (HTML) when present
+    # renderedFields preferred
     rendered = issue.get("renderedFields") or {}
     if rendered:
         all_urls.update(extract_urls_from_html(rendered.get("description", "")))
-        # rendered comments
         comm_block = rendered.get("comment") or {}
         if isinstance(comm_block, dict):
             for c in comm_block.get("comments", []):
                 body = c.get("body") or c.get("renderedBody") or ""
                 all_urls.update(extract_urls_from_html(body))
 
-    # 2) raw fields
+    # raw fields
     fields = issue.get("fields") or {}
     all_urls.update(extract_urls_from_html(fields.get("description", "")))
-    # raw comments
     comments = fields.get("comment", {}).get("comments", []) if isinstance(fields.get("comment", {}), dict) else []
     for c in comments:
         body = c.get("body", "")
         all_urls.update(extract_urls_from_html(body))
         all_urls.update(extract_urls_from_text(body))
 
-    # attachments explicitly
+    # attachments
     for att in fields.get("attachment", []) if isinstance(fields.get("attachment", []), list) else []:
         all_urls.update(scan_attachment_for_urls(att))
 
-    # fallback: full recursive scan
+    # fallback: scan everything
     all_urls.update(recursive_scan_for_urls(issue))
 
-    # Normalize absolute URLs relative to host_base where necessary
+    # normalize and filter
     normalized = set()
     for u in all_urls:
         if not isinstance(u, str) or not u.strip():
             continue
-        # make absolute if relative
         if u.startswith("/"):
             u = urljoin(host_base, u)
         normalized.add(u.strip())
 
-    # Filter out internal REST API noise
-    jira_host = urlparse(browse_url).netloc
-    filtered = filter_out_internal_jira_urls(normalized, f"{urlparse(browse_url).scheme}://{jira_host}")
+    filtered = filter_out_internal_jira_urls(normalized, host_base)
+    return sorted(filtered)
 
-    # Final: remove duplicates, sort
-    final_list = sorted(filtered)
-    return final_list
+def parse_args():
+    p = argparse.ArgumentParser(description="Extract URLs from JIRA browse URLs using internal.Jira.get_ori")
+    p.add_argument("browse_urls", nargs="*", help="one or more jira browse URLs")
+    p.add_argument("--file", "-f", help="newline-separated file with browse URLs")
+    p.add_argument("--out", "-o", default="jira_issue_urls.json", help="output JSON filename")
+    return p.parse_args()
 
 def main():
-    # CLI override: pass browse URLs as args
-    args = sys.argv[1:]
-    if args:
-        urls_to_process = args
-    else:
-        urls_to_process = browse_urls
+    args = parse_args()
+    urls = []
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            print(f"File not found: {args.file}")
+            return
+        urls = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if args.browse_urls:
+        urls.extend(args.browse_urls)
+    if not urls:
+        print("No browse URLs provided. Provide as CLI args or via --file urls.txt")
+        return
 
     jira = Jira()
     out = {}
-
-    for b in urls_to_process:
+    for b in urls:
         try:
-            urls = process_single(jira, b)
+            res = process_single(jira, b)
         except Exception as e:
             print(f"Error processing {b}: {e}")
-            urls = []
-        out[b] = urls
-        print(f" -> {len(urls)} urls found for {b}")
+            res = []
+        out[b] = res
+        print(f" -> {len(res)} urls found for {b}")
 
-    Path(OUTPUT_FILE).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nDone. Results saved to {OUTPUT_FILE}")
+    Path(args.out).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Saved results to {args.out}")
 
 if __name__ == "__main__":
     main()
